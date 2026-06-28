@@ -385,17 +385,18 @@ class VectorStore:
 
         if self.qclient:
             try:
-                search_results = self.qclient.search(
+                # qdrant-client >=1.10 renamed search() -> query_points() with `query=` arg
+                search_results = self.qclient.query_points(
                     collection_name=collection_name,
-                    query_vector=vector,
+                    query=vector,
                     query_filter={
                         "must": [
                             {"key": "entity_name", "match": {"value": entity_name}}
                         ]
                     },
                     limit=limit
-                )
-                
+                ).points
+
                 chunk_ids = [r.payload["chunk_id"] for r in search_results]
                 
                 # Fetch full data from sqlite
