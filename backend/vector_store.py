@@ -17,6 +17,19 @@ except ImportError:
     QDRANT_AVAILABLE = False
     logger.warning("qdrant-client not installed. Using in-memory fallback vector search.")
 
+# ── Embedding config ─────────────────────────────────────────
+# Switched 2026-06-28 from paid openai/text-embedding-3-small (1536 dim) to
+# local qwen3-embedding:8b via Ollama (4096 dim). Reasons:
+#   - $0 forever (no per-token cost on OpenRouter)
+#   - No rate limits (lives on disk)
+#   - Top-5 MTEB retrieval quality (qwen3-embedding:8b)
+#   - Same family as qwen3 chat models already in OLLAMA_CHAT_MODELS
+# Set TANGLE_EMBEDDING_SOURCE=openrouter to revert (costs money, 1536 dim).
+EMBEDDING_DIM = 4096
+EMBEDDING_MODEL = os.getenv("TANGLE_OLLAMA_EMBED_MODEL", "qwen3-embedding:8b")
+EMBEDDING_SOURCE = os.getenv("TANGLE_EMBEDDING_SOURCE", "ollama").strip().lower()
+OLLAMA_BASE = "http://localhost:11434"  # matches free_gateway.py:9
+
 # ── Supabase toggle ─────────────────────────────────────────
 SUPABASE_ENABLED = os.getenv("TANGLE_SUPABASE_ENABLED", "").strip() in ("1", "true", "True")
 SUPABASE_AVAILABLE = False
@@ -25,7 +38,13 @@ if SUPABASE_ENABLED:
     try:
         from supabase import create_client, Client
         _supabase_url = os.getenv("SUPABASE_URL", "")
-        _supabase_key = os.getenv("SUPABASE_ANON_KEY", "")
+        # Prefer SERVICE_ROLE (secret key in Supabase CLI v2) for backend writes
+        # — it bypasses RLS and can run ALTER TABLE / CREATE EXTENSION via exec_sql.
+        # Fall back to ANON (publishable key) only if SERVICE_ROLE is absent.
+        _supabase_key = (
+            os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
+            or os.getenv("SUPABASE_ANON_KEY", "")
+        )
         if _supabase_url and _supabase_key:
             _supabase_client = create_client(_supabase_url, _supabase_key)
             SUPABASE_AVAILABLE = True
@@ -127,11 +146,11 @@ class VectorStore:
             # must be created manually in Supabase SQL Editor (see .env.example).
             # If the column doesn't exist yet, ALTER TABLE ADD COLUMN IF NOT EXISTS
             # is idempotent and won't break the table probe.
-            "ALTER TABLE wiki_entries ADD COLUMN IF NOT EXISTS embedding vector(1536);"
+            "ALTER TABLE wiki_entries ADD COLUMN IF NOT EXISTS embedding vector(4096);"
             # Search RPC function — called by _search_wiki_supabase() for
             # pgvector cosine similarity search. Must exist for pgvector fallback.
             "CREATE OR REPLACE FUNCTION search_wiki_entries("
-            "query_embedding vector(1536), match_entity text, match_limit int DEFAULT 5"
+            "query_embedding vector(4096), match_entity text, match_limit int DEFAULT 5"
             ") RETURNS TABLE(chunk_id text, entity_name text, filename text, "
             "filepath text, raw_content text, markdown text, confidence real, "
             "timestamp text, similarity float) LANGUAGE plpgsql AS $$ "
@@ -156,36 +175,76 @@ class VectorStore:
                 )
 
     async def get_embeddings(self, text: str) -> List[float]:
-        """Generates embedding vector for text using OpenRouter or fallback"""
-        if not self.openrouter_key:
+        """Generate embeddings. Default = local Ollama (qwen3-embedding:8b, 4096 dim).
+
+        Routes by TANGLE_EMBEDDING_SOURCE:
+          - "ollama"    (default): local via Ollama, $0
+          - "openrouter": paid via openai/text-embedding-3-small (1536 dim, NOT 4096)
+          - "sha256":   deterministic hash fallback for offline
+        Falls back to sha256 hash vector on any failure.
+        """
+        if EMBEDDING_SOURCE == "openrouter" and self.openrouter_key:
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.post(
+                        "https://openrouter.ai/api/v1/embeddings",
+                        headers={
+                            "Authorization": f"Bearer {self.openrouter_key}",
+                            "Content-Type": "application/json",
+                        },
+                        json={"model": "openai/text-embedding-3-small", "input": text},
+                        timeout=10,
+                    )
+                    if resp.status_code == 200:
+                        return resp.json()["data"][0]["embedding"]
+                    logger.error(f"OpenRouter embedding error: {resp.status_code}")
+            except Exception as e:
+                logger.error(f"OpenRouter embedding failed: {e}")
             return self._generate_dummy_vector(text)
 
+        if EMBEDDING_SOURCE == "ollama":
+            return await self._get_ollama_embeddings(text)
+
+        # sha256 fallback (deterministic, no model)
+        return self._generate_dummy_vector(text)
+
+    async def _get_ollama_embeddings(self, text: str) -> List[float]:
+        """Generate embeddings via local Ollama. Default model: qwen3-embedding:8b.
+
+        Set OLLAMA_NUM_GPU=<N> to cap GPU layers (Per: ~50 to share with browser).
+        """
+        payload: Dict[str, Any] = {"model": EMBEDDING_MODEL, "input": text}
+        gpu_cap = os.getenv("OLLAMA_NUM_GPU")
+        if gpu_cap:
+            try:
+                payload["options"] = {"num_gpu": int(gpu_cap)}
+            except ValueError:
+                logger.warning(f"OLLAMA_NUM_GPU={gpu_cap!r} not an int, ignoring")
         try:
-            # We can use text-embedding-3-small via OpenRouter
             async with httpx.AsyncClient() as client:
                 resp = await client.post(
-                    "https://openrouter.ai/api/v1/embeddings",
-                    headers={
-                        "Authorization": f"Bearer {self.openrouter_key}",
-                        "Content-Type": "application/json"
-                    },
-                    json={
-                        "model": "openai/text-embedding-3-small",
-                        "input": text
-                    },
-                    timeout=10
+                    f"{OLLAMA_BASE}/api/embed",
+                    json=payload,
+                    timeout=120,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
-                    return data["data"][0]["embedding"]
+                    vecs = data.get("embeddings") or []
+                    if vecs and len(vecs[0]) == EMBEDDING_DIM:
+                        return vecs[0]
+                    actual = len(vecs[0]) if vecs else 0
+                    logger.error(
+                        f"Ollama embedding dim mismatch from {EMBEDDING_MODEL}: "
+                        f"got {actual}, expected {EMBEDDING_DIM}. "
+                        f"Pull the right model? ollama pull {EMBEDDING_MODEL}"
+                    )
                 else:
-                    logger.error(f"OpenRouter embedding error: {resp.status_code} - {resp.text}")
+                    logger.error(f"Ollama embedding error {resp.status_code}: {resp.text[:200]}")
         except Exception as e:
-            logger.error(f"Error generating embeddings: {e}")
-            
+            logger.error(f"Ollama embedding failed (is `ollama serve` running?): {e}")
         return self._generate_dummy_vector(text)
 
-    def _generate_dummy_vector(self, text: str, dimensions: int = 1536) -> List[float]:
+    def _generate_dummy_vector(self, text: str, dimensions: int = EMBEDDING_DIM) -> List[float]:
         """Generates a pseudo-deterministic vector based on text hashing for offline fallback"""
         import hashlib
         h = hashlib.sha256(text.encode()).digest()
