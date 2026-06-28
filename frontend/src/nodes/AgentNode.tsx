@@ -40,7 +40,7 @@ const AgentNode = memo(({ data }: NodeProps) => {
   const [activeTab, setActiveTab] = useState<Tab>('overview');
   const status = useAgentStore(s => s.agentStatuses[nodeData.agentId] || 'idle');
   const verboseLogs = useAgentStore(s => s.verboseLogs[nodeData.agentId] || []);
-  const { color: sc, label } = STATUS_CFG[status];
+  const { label } = STATUS_CFG[status];
   const accent = AGENT_COLORS[nodeData.agentId] || '#06b6d4';
   const emoji = AGENT_EMOJIS[nodeData.agentId] || '🤖';
   const isActive = status !== 'idle';

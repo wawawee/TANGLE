@@ -74,7 +74,7 @@ export default function ChatBox() {
             value={input}
             onChange={(e) => setInput(e.target.value)}
             onKeyDown={(e) => e.key === 'Enter' && handleSend()}
-            placeholder="Talk to ANLAGSTAVLAN..."
+            placeholder="Talk to TANGLE..."
             className="w-full bg-white/60 border border-black/5 rounded-xl px-3 py-2 text-[10px] focus:outline-none focus:ring-2 focus:ring-purple-400 transition-all"
           />
           <button onClick={handleSend} className="absolute right-2 top-1.5 p-1 text-purple-600 hover:text-purple-800 transition-all">

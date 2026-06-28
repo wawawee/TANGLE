@@ -126,6 +126,7 @@ const MOCK_QDRANT_COLLECTIONS: QdrantCollection[] = [
 ];
 
 let eventCounter = 0;
+let ws: WebSocket | null = null;
 
 export const useAgentStore = create<AgentStore>((set, get) => ({
   agentStatuses: {},
@@ -170,7 +171,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
       ws = new WebSocket('ws://localhost:8000/api/ws/agents');
       ws.onopen = () => set({ wsConnected: true });
       ws.onclose = () => set({ wsConnected: false });
-      ws.onmessage = (ev) => {
+      ws.onmessage = (ev: MessageEvent) => {
         try {
           const event = JSON.parse(ev.data);
           const store = get();

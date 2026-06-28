@@ -36,7 +36,7 @@ function IntensityCube({ intensity }: { intensity: number }) {
           anchorX="center"
           anchorY="middle"
         >
-          ANLAGSTAVLAN
+          TANGLE
         </Text>
         <Text
           position={[0, -0.4, 1.6]}

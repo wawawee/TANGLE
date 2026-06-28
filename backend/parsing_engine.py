@@ -1,10 +1,11 @@
 """Universal file ingestion & parsing engine for TANGLE"""
 
 import os
+import re
 import uuid
 import logging
 from datetime import datetime, timezone
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 
 logger = logging.getLogger("tangle.parser")
 
@@ -19,6 +20,14 @@ class ParsingEngine:
     def __init__(self, gateway=None):
         self.gateway = gateway
         self.mid = MarkItDown() if MARKITDOWN_AVAILABLE else None
+        self.tag_model = "openrouter/nvidia/nemotron-nano-12b-v2-vl:free"
+
+    # Fixed taxonomy that the tag-generation prompt steers the LLM toward.
+    # Model may invent new tags outside this list when none fit.
+    TAG_TAXONOMY = (
+        "#health #finance #legal #contact #risk #opportunity "
+        "#threat #context #research #urgent"
+    )
 
     async def parse_file(self, filepath: str, entity_name: str) -> Dict[str, Any]:
         """
@@ -57,6 +66,12 @@ class ParsingEngine:
         chunk_id = str(uuid.uuid4())
         timestamp = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
+        # Auto-tag via cheap LLM. Falls back to ['untagged'] on any failure
+        # (no gateway, LLM error, malformed output). Cost discipline: single
+        # call with a short prompt and content capped at 2000 chars.
+        tags = await self._generate_tags(content, entity_name)
+
+        tag_line = " ".join(f"#{t}" for t in tags)
         structured_markdown = (
             f"# Entity: {entity_name}\n"
             f"## Source: {filename}\n"
@@ -67,7 +82,7 @@ class ParsingEngine:
             f"### Related Chunks\n"
             f"- [[source-file:{filename}]]\n\n"
             f"### Tags\n"
-            f"- #untagged\n"
+            f"- {tag_line}\n"
         )
 
         return {
@@ -80,7 +95,30 @@ class ParsingEngine:
             "timestamp": timestamp,
             "is_image": is_image,
             "parse_error": parse_error,
+            "tags": tags,
         }
+
+    @staticmethod
+    def _extract_inline_tags(markdown: str) -> List[str]:
+        """Extract #tags from markdown text. Word-boundary aware so C# / F# are ignored.
+
+        Returns deduped tags (lowercase), preserving first-seen order.
+        Used both internally for parsing the LLM tag response and exported for
+        the orchestrator + tests.
+        """
+        if not markdown:
+            return []
+        # Hash must be preceded by start-of-string or whitespace (avoids C# / F# / #5)
+        found = re.findall(r"(?:^|\s)#([a-z0-9][a-z0-9_-]{1,30})", markdown.lower())
+        seen: set = set()
+        unique: List[str] = []
+        for t in found:
+            if t not in seen:
+                seen.add(t)
+                unique.append(t)
+            if len(unique) >= 8:
+                break
+        return unique
 
     def _fallback_parse(self, filepath: str) -> Tuple[str, Optional[str]]:
         """
@@ -92,6 +130,66 @@ class ParsingEngine:
                 return f.read(), None
         except Exception as e:
             return f"[Parsing Error: Could not read file content. {e}]", str(e)
+
+    async def _generate_tags(self, content: str, entity_name: str) -> List[str]:
+        """Auto-generate 3-5 #tags for the chunk using a cheap LLM.
+
+        Cost discipline:
+        - Single LLM call per chunk
+        - Content capped at 2000 chars (truncate from middle, keep start+end)
+        - Uses the cheap nemotron vision model (handles text too)
+        - Falls back to ['untagged'] on any failure (no gateway, error, empty
+          content, malformed output) — never raises
+
+        Tag rules:
+        - Lowercase, alphanumeric + dash/underscore
+        - Dedupe and cap at 5 tags per chunk
+        - Prefer the fixed taxonomy (TAG_TAXONOMY) but allow the model to
+          invent new ones when nothing fits (e.g. #cat, #invoice)
+        """
+        if not content or not content.strip():
+            return ["untagged"]
+        if not self.gateway:
+            logger.debug("No gateway for tag generation; using 'untagged' fallback.")
+            return ["untagged"]
+
+        # Truncate content intelligently — keep start + end so context is preserved
+        MAX_CONTENT_CHARS = 2000
+        if len(content) > MAX_CONTENT_CHARS:
+            half = MAX_CONTENT_CHARS // 2
+            content_for_llm = content[:half] + "\n\n[...truncated...]\n\n" + content[-half:]
+        else:
+            content_for_llm = content
+
+        prompt = (
+            f"Read this content about the entity '{entity_name}'. "
+            f"Produce 3-5 hashtags that describe what this content is about.\n\n"
+            f"Preferred tags (use when relevant): {self.TAG_TAXONOMY}\n\n"
+            f"You may invent new tags if none of those fit (lowercase, alphanumeric, "
+            f"one word or hyphenated — e.g. #cat, #invoice, #q3-report).\n\n"
+            f"Reply with ONLY the hashtags, space-separated, nothing else. "
+            f"Example response: #health #vet #cat #diet\n\n"
+            f"Content:\n{content_for_llm}"
+        )
+
+        try:
+            resp = await self.gateway.chat(
+                self.tag_model,
+                [{"role": "user", "content": prompt}],
+            )
+            raw = (resp.get("content") or "").strip()
+            unique = self._extract_inline_tags(raw)
+            if not unique:
+                logger.warning(f"Tag LLM returned no parseable hashtags for {entity_name}: {raw[:80]!r}")
+                return ["untagged"]
+            # Cap at 5 for chunks (orchestrator/wiki body caps at 8)
+            if len(unique) > 5:
+                unique = unique[:5]
+            logger.info(f"Generated tags for {entity_name}: {unique}")
+            return unique
+        except Exception as e:
+            logger.warning(f"Tag generation failed for {entity_name}: {e}")
+            return ["untagged"]
 
     async def _parse_image_vision(self, filepath: str, entity_name: str) -> tuple[str, float]:
         """

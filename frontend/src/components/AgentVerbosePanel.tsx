@@ -9,11 +9,6 @@ const AGENT_COLORS: Record<string, string> = {
   '13': '#c084fc', '14': '#fb923c', '15': '#34d399', '16': '#e879f9',
 };
 
-const EVENT_ICONS: Record<string, string> = {
-  agent_start: '▶️', agent_think: '💭', agent_complete: '✅', agent_error: '❌',
-  tool_call: '🔧', tool_result: '📦', delegate: '🔀', workflow_step: '📋',
-};
-
 export default function AgentVerbosePanel() {
   const { verboseLogs, gatewayStatus, wsConnected, executeAgent } = useAgentStore();
   const scrollRef = useRef<HTMLDivElement>(null);

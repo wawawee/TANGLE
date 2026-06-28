@@ -9,9 +9,11 @@ import signal
 import os, json, shutil
 import asyncio
 import logging
-from datetime import datetime
+import sqlite3
+from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
+import httpx
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,6 +46,7 @@ from langgraph_engine import LangGraphEngine
 from task_manager import TaskListManager
 from kanban_store import KanbanBoard
 from run_history import RunHistory
+from wiki_vault import WikiVault
 
 gateway = FreeGateway()
 orchestrator = AgentOrchestrator(gateway)
@@ -52,6 +55,7 @@ langgraph_engine.compile()
 task_manager = TaskListManager()
 kanban_board = KanbanBoard()
 run_history = RunHistory()
+wiki_vault = WikiVault()
 
 app = FastAPI(title="TANGLE Agentic API")
 
@@ -392,13 +396,29 @@ async def start_mission(req: MissionRequest):
     try:
         logger.info(f"Starting assistance mission for entity: {req.entity}, file: {req.filepath}")
         result = await orchestrator.run_mission(req.entity, req.filepath)
-        return {
-            "success": True,
-            "mission_id": result["mission_id"],
-            "entity": result["entity_name"],
-            "report": result["report"],
-            "wiki_entry": result["wiki_entry"]
+        # Forward every orchestrator key the API surface actually uses. We deliberately
+        # pass-through instead of cherry-picking so future orchestrator additions (e.g. a new
+        # dual-output field) reach the frontend without an endpoint edit each time.
+        # NOTE: `entity_name` is renamed to `entity` for API ergonomics — both stay populated
+        # for backwards compatibility with older frontends that read `entity_name`.
+        forward_keys = {
+            "mission_id",
+            "entity_name",
+            "report",
+            "report_markdown",
+            "wiki_entry_markdown",
+            "wiki_entry_chunk_id",
+            "wiki_entry",
+            "verified",
+            "critic_score",
+            "critic_critique",
+            "usage",
+            "wiki_export",
         }
+        forwarded = {k: result[k] for k in forward_keys if k in result}
+        forwarded["success"] = True
+        forwarded["entity"] = result.get("entity_name", req.entity)
+        return forwarded
     except Exception as e:
         logger.error(f"Mission failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -615,6 +635,148 @@ async def delete_run(run_id: str):
     if not run_history.delete(run_id):
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     return {"deleted": run_id}
+
+# ─────────────────────────────────────────────────────────────
+# Admin: Index + Wiki Vault
+# ─────────────────────────────────────────────────────────────
+
+@app.get("/api/admin/index")
+async def admin_index():
+    """Live snapshot of every store TANGLE uses: SQLite, Qdrant, filesystem.
+    Supabase is reported as 'not_connected' — backend integration is Phase 1+ scope
+    per AGENTS.md; only the frontend stub exists today.
+    """
+    # 1. SQLite
+    sqlite_info: Dict[str, Any] = {
+        "path": str(Path(__file__).parent / "tangle.db"),
+        "exists": (Path(__file__).parent / "tangle.db").exists(),
+        "wiki_entries_count": 0,
+        "missions_count": 0,
+        "by_entity": {},
+        "oldest_entry": None,
+        "newest_entry": None,
+    }
+    if sqlite_info["exists"]:
+        try:
+            conn = sqlite3.connect(sqlite_info["path"])
+            cur = conn.cursor()
+            sqlite_info["wiki_entries_count"] = cur.execute(
+                "SELECT COUNT(*) FROM wiki_entries"
+            ).fetchone()[0]
+            sqlite_info["missions_count"] = cur.execute(
+                "SELECT COUNT(*) FROM missions"
+            ).fetchone()[0]
+            rows = cur.execute(
+                "SELECT entity_name, COUNT(*) FROM wiki_entries "
+                "GROUP BY entity_name ORDER BY entity_name"
+            ).fetchall()
+            sqlite_info["by_entity"] = {r[0]: r[1] for r in rows}
+            ts_row = cur.execute(
+                "SELECT MIN(timestamp), MAX(timestamp) FROM wiki_entries"
+            ).fetchone()
+            if ts_row and ts_row[0]:
+                sqlite_info["oldest_entry"] = ts_row[0]
+                sqlite_info["newest_entry"] = ts_row[1]
+            conn.close()
+        except Exception as e:
+            sqlite_info["error"] = str(e)
+
+    # 2. Qdrant
+    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    qdrant_info: Dict[str, Any] = {
+        "url": qdrant_url,
+        "reachable": False,
+        "collection": "tangle_wiki_memories",
+        "collection_exists": False,
+        "points_count": 0,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            h = await client.get(f"{qdrant_url}/healthz")
+            qdrant_info["reachable"] = h.status_code == 200
+            if qdrant_info["reachable"]:
+                try:
+                    c = await client.get(f"{qdrant_url}/collections/tangle_wiki_memories")
+                    if c.status_code == 200:
+                        qdrant_info["collection_exists"] = True
+                        qdrant_info["points_count"] = (
+                            c.json().get("result", {}).get("points_count", 0)
+                        )
+                except Exception:
+                    pass
+    except Exception as e:
+        qdrant_info["error"] = str(e)
+
+    # 3. Supabase — explicit not_connected per AGENTS.md Phase 1+ scope
+    supabase_url = os.getenv("SUPABASE_URL", "")
+    supabase_key = os.getenv("SUPABASE_ANON_KEY", "")
+    supabase_info: Dict[str, Any] = {
+        "configured": bool(supabase_url and supabase_key),
+        "status": "not_connected",
+        "phase": "1+",
+        "note": "Backend integration deferred. Frontend stub node only. "
+                "See AGENTS.md 'What NOT to do (yet)'.",
+        "entries_count": 0,
+    }
+
+    # 4. Filesystem wiki vault
+    fs_info: Dict[str, Any] = {
+        "vault_root": str(wiki_vault.vault_root),
+        "exists": wiki_vault.vault_root.exists(),
+        "files": 0,
+        "entities": 0,
+        "last_modified": None,
+    }
+    try:
+        c = wiki_vault.count()
+        fs_info.update(c)
+        if fs_info.get("last_modified"):
+            fs_info["last_modified"] = datetime.fromtimestamp(
+                fs_info["last_modified"], tz=timezone.utc
+            ).isoformat().replace("+00:00", "Z")
+    except Exception as e:
+        fs_info["error"] = str(e)
+
+    # 5. Uploads directory (raw files)
+    uploads_dir = Path(__file__).parent.parent / "uploads"
+    uploads_info = {
+        "path": str(uploads_dir),
+        "exists": uploads_dir.exists(),
+        "files": len(list(uploads_dir.glob("*"))) if uploads_dir.exists() else 0,
+    }
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "sqlite": sqlite_info,
+        "qdrant": qdrant_info,
+        "supabase": supabase_info,
+        "filesystem": fs_info,
+        "uploads": uploads_info,
+        "stores_healthy": (
+            sqlite_info["exists"]
+            and (qdrant_info["reachable"] or sqlite_info["wiki_entries_count"] > 0)
+        ),
+    }
+
+@app.post("/api/admin/export-wiki")
+async def admin_export_wiki():
+    """Rebuild the Obsidian-compatible wiki vault at docs/wiki/.
+    Reads every entry from SQLite, writes per-chunk markdown files with
+    YAML frontmatter, plus INDEX / TAGS / _meta and per-entity indexes.
+
+    Safe to call repeatedly — full rebuild every time.
+    """
+    try:
+        return wiki_vault.export_all()
+    except Exception as e:
+        logger.error(f"Wiki vault export failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/export-wiki/preview")
+async def admin_export_wiki_preview():
+    """Dry-run: show what export-wiki would do without writing files.
+    Useful for sanity-checking before triggering a full rebuild."""
+    return wiki_vault.preview_export()
 
 if __name__ == "__main__":
     import uvicorn

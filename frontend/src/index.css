@@ -1,6 +1,6 @@
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap');
 
-/* ─── ANLAGSTAVLAN Light Glass Tokens ───────────────────────── */
+/* ─── TANGLE Light Glass Tokens ─────────────────────────────── */
 :root {
   --void: #f8fafc;
   --surface: rgba(255,255,255,0.7);
@@ -113,6 +113,93 @@ body {
 ::-webkit-scrollbar-track  { background: transparent; }
 ::-webkit-scrollbar-thumb  { background: rgba(255,255,255,0.1); border-radius: 2px; }
 ::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.2); }
+
+/* ─── Markdown report rendering ──────────────────────────── */
+.tangle-markdown-report {
+  font-size: 11px;
+  line-height: 1.7;
+  color: rgba(255,255,255,0.6);
+}
+.tangle-markdown-report h1,
+.tangle-markdown-report h2,
+.tangle-markdown-report h3 {
+  color: rgba(255,255,255,0.85);
+  margin: 14px 0 6px;
+  font-weight: 700;
+  letter-spacing: -0.01em;
+}
+.tangle-markdown-report h1 { font-size: 16px; border-bottom: 1px solid rgba(255,255,255,0.08); padding-bottom: 4px; }
+.tangle-markdown-report h2 { font-size: 13px; }
+.tangle-markdown-report h3 { font-size: 11px; color: rgba(192,132,252,0.8); }
+.tangle-markdown-report p { margin: 4px 0 8px; }
+.tangle-markdown-report ul, .tangle-markdown-report ol { padding-left: 18px; margin: 4px 0 8px; }
+.tangle-markdown-report li { margin-bottom: 2px; }
+.tangle-markdown-report li::marker { color: rgba(139,92,246,0.5); }
+.tangle-markdown-report strong { color: rgba(255,255,255,0.85); font-weight: 700; }
+.tangle-markdown-report em { color: rgba(255,255,255,0.5); }
+.tangle-markdown-report code {
+  background: rgba(139,92,246,0.12);
+  color: #c084fc;
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 10px;
+}
+.tangle-markdown-report pre {
+  background: rgba(0,0,0,0.3);
+  border: 1px solid rgba(255,255,255,0.06);
+  border-radius: 8px;
+  padding: 10px 12px;
+  overflow-x: auto;
+  margin: 8px 0;
+}
+.tangle-markdown-report pre code {
+  background: transparent;
+  color: rgba(255,255,255,0.55);
+  padding: 0;
+  font-size: 10px;
+}
+.tangle-markdown-report blockquote {
+  border-left: 3px solid rgba(139,92,246,0.3);
+  padding-left: 12px;
+  margin: 8px 0;
+  color: rgba(255,255,255,0.4);
+  font-style: italic;
+}
+.tangle-markdown-report a {
+  color: #06b6d4;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.tangle-markdown-report hr {
+  border: none;
+  border-top: 1px solid rgba(255,255,255,0.06);
+  margin: 12px 0;
+}
+.tangle-markdown-report table {
+  border-collapse: collapse;
+  width: 100%;
+  font-size: 10px;
+  margin: 8px 0;
+}
+.tangle-markdown-report th {
+  background: rgba(139,92,246,0.1);
+  padding: 4px 8px;
+  text-align: left;
+  font-weight: 700;
+  color: rgba(255,255,255,0.7);
+  border: 1px solid rgba(255,255,255,0.06);
+}
+.tangle-markdown-report td {
+  padding: 4px 8px;
+  border: 1px solid rgba(255,255,255,0.04);
+  color: rgba(255,255,255,0.5);
+}
+
+/* ─── Canvas prompt placeholder ──────────────────────────── */
+.canvas-prompt-input::placeholder {
+  color: rgba(255,255,255,0.25);
+}
 
 /* ─── Utility ────────────────────────────────────────────── */
 .glass {

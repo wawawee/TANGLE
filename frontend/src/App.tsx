@@ -8,53 +8,51 @@ import {
     ReactFlowProvider,
     useEdgesState,
     useNodesState,
+    useReactFlow,
     type Edge,
     type Node,
 } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
+
+// Width of the right-side panel (INDEX / CLI / LOGS). Kept here so all three
+// wrapper <div>s and the toggle width formula stay in sync.
+const SIDE_PANEL_WIDTH = 520;
+const LS_KEY = 'tangle-canvas-state';
+const STATIC_NODE_IDS = new Set(['orchestrator', 'qdrant', 'file-memory', 'agent-16']);
 
 import AgentVerbosePanel from './components/AgentVerbosePanel';
 import ChatBox from './components/ChatBox';
 import CliHarness from './components/CliHarness';
 import EdgeTelemetry from './components/EdgeTelemetry';
 import Experience3D from './components/Experience3D';
-import AgentNode from './nodes/AgentNode';
+import IndexPanel from './components/IndexPanel';
+
 import MemoryNode from './nodes/MemoryNode';
+import type { PipelineNodeData } from './nodes/PipelineNode';
 import OrchestratorNode from './nodes/OrchestratorNode';
 import SystemGuardianNode from './nodes/SystemGuardianNode';
-import type { ActiveFlow } from './store/agentStore';
+import SourceNode from './nodes/SourceNode';
+import type { SourceNodeData } from './nodes/SourceNode';
+import EntityNode from './nodes/EntityNode';
+import type { EntityNodeData } from './nodes/EntityNode';
+import PipelineNode from './nodes/PipelineNode';
+
 import { useAgentStore } from './store/agentStore';
 
 // ─── Node Types ───────────────────────────────────────────────
 const NODE_TYPES = {
-  agent: AgentNode,
   orchestrator: OrchestratorNode,
   systemGuardian: SystemGuardianNode,
   memory: MemoryNode,
+  source: SourceNode,
+  entity: EntityNode,
+  pipeline: PipelineNode,
 };
 
 const EDGE_TYPES = {
   telemetry: EdgeTelemetry,
 };
-
-// ─── Agent Definitions ────────────────────────────────────────
-const AGENTS = [
-  { id: '01', name: 'Scout',     codename: 'SCOUT',    role: 'Researcher',           collection: 'research_memories' },
-  { id: '02', name: 'Blueprint', codename: 'BLUEPRINT', role: 'Architect',            collection: 'architecture_memories' },
-  { id: '03', name: 'Forge',     codename: 'FORGE',    role: 'Code Writer',          collection: 'code_memories' },
-  { id: '04', name: 'Hammer',    codename: 'HAMMER',   role: 'QA Engineer',          collection: 'qa_memories' },
-  { id: '05', name: 'Aegis',     codename: 'AEGIS',    role: 'Security Sentinel',    collection: 'security_memories' },
-  { id: '06', name: 'Pipeline',  codename: 'PIPELINE', role: 'Data Engineer',        collection: 'data_memories' },
-  { id: '07', name: 'Launcher',  codename: 'LAUNCHER', role: 'DevOps Runner',        collection: 'devops_memories' },
-  { id: '08', name: 'Canvas',    codename: 'CANVAS',   role: 'UX Designer',          collection: 'ux_memories' },
-  { id: '09', name: 'Scribe',    codename: 'SCRIBE',   role: 'Technical Writer',     collection: 'docs_memories' },
-  { id: '10', name: 'Tracer',    codename: 'TRACER',   role: 'Debugger',             collection: 'debug_memories' },
-  { id: '11', name: 'Turbo',     codename: 'TURBO',    role: 'Performance Tuner',    collection: 'performance_memories' },
-  { id: '12', name: 'Bridge',    codename: 'BRIDGE',   role: 'Integration Specialist', collection: 'integration_memories' },
-  { id: '14', name: 'Packager',  codename: 'PACKAGER', role: 'Package Manager',      collection: 'package_memories' },
-  { id: '15', name: 'Inspector', codename: 'INSPECTOR', role: 'Examination Agent',   collection: 'examination_memories' },
-];
 
 // ─── Canvas Layout ─────────────────────────────────────────────
 const makeNodes = (): Node[] => {
@@ -63,7 +61,7 @@ const makeNodes = (): Node[] => {
   nodes.push({
     id: 'orchestrator',
     type: 'orchestrator',
-    position: { x: 700, y: 460 },
+    position: { x: 400, y: 460 },
     data: {},
     draggable: true,
   });
@@ -71,23 +69,15 @@ const makeNodes = (): Node[] => {
   nodes.push({
     id: 'qdrant',
     type: 'memory',
-    position: { x: 700, y: 80 },
+    position: { x: 80, y: 80 },
     data: { nodeType: 'qdrant', label: 'Qdrant Cloud' },
-    draggable: true,
-  });
-
-  nodes.push({
-    id: 'supabase',
-    type: 'memory',
-    position: { x: 1320, y: 560 },
-    data: { nodeType: 'supabase', label: 'Supabase DB' },
     draggable: true,
   });
 
   nodes.push({
     id: 'file-memory',
     type: 'memory',
-    position: { x: 60, y: 80 },
+    position: { x: 80, y: 680 },
     data: { nodeType: 'file', label: 'Markdown Files' },
     draggable: true,
   });
@@ -95,94 +85,13 @@ const makeNodes = (): Node[] => {
   nodes.push({
     id: 'agent-16',
     type: 'systemGuardian',
-    position: { x: 1320, y: 300 },
+    position: { x: 1100, y: 460 },
     data: {},
     draggable: true,
   });
 
-  const ring1 = ['01', '02', '03', '04', '05', '06', '07'];
-  ring1.forEach((id, i) => {
-    const agent = AGENTS.find(a => a.id === id)!;
-    nodes.push({
-      id: `agent-${id}`,
-      type: 'agent',
-      position: { x: 60 + i * 230, y: 280 },
-      data: { agentId: id, ...agent },
-      draggable: true,
-    });
-  });
-
-  const ring2 = ['08', '09', '10', '11', '12', '14', '15'];
-  ring2.forEach((id, i) => {
-    const agent = AGENTS.find(a => a.id === id)!;
-    nodes.push({
-      id: `agent-${id}`,
-      type: 'agent',
-      position: { x: 60 + i * 230, y: 680 },
-      data: { agentId: id, ...agent },
-      draggable: true,
-    });
-  });
-
   return nodes;
 };
-
-const BASE_MARKER = {
-  type: MarkerType.ArrowClosed,
-  color: 'var(--border-bright)',
-  width: 10,
-  height: 10,
-};
-
-const makeEdges = (): Edge[] => {
-  const e: Edge[] = [];
-
-  const connect = (source: string, target: string, id: string, label = '', color?: string) =>
-    e.push({
-      id, source, target,
-      type: 'telemetry',
-      data: { edgeId: id, label, color, sourceId: source, targetId: target },
-      markerEnd: { ...BASE_MARKER, color: color || 'var(--border-bright)' },
-      animated: false,
-    });
-
-  AGENTS.forEach(a => {
-    connect('orchestrator', `agent-${a.id}`, `e-orch-${a.id}`, `Delegate → ${a.codename}`);
-    connect(`agent-${a.id}`, 'orchestrator', `e-${a.id}-orch`, `Report → Maestro`);
-  });
-
-  connect('orchestrator', 'agent-16', 'e-orch-16', 'Approve → WATCHDOG');
-  connect('agent-16', 'orchestrator', 'e-16-orch', 'Escalate → Maestro');
-
-  AGENTS.forEach(a => connect(`agent-${a.id}`, 'qdrant', `e-${a.id}-qdrant`, 'Vector Search'));
-  connect('agent-16', 'qdrant', 'e-16-qdrant', 'Memory Write');
-
-  ['07', '12', '06', '14'].forEach(id => connect(`agent-${id}`, 'supabase', `e-${id}-sb`, 'SQL Query'));
-
-  ['09', '01', '02', '15'].forEach(id => connect(`agent-${id}`, 'file-memory', `e-${id}-fm`, 'Read Markdown'));
-  connect('agent-15', 'file-memory', 'e-15-fm', 'Write TASKLIST');
-
-  connect('agent-01', 'agent-02', 'e-01-02', 'POST /handoff → Research package');
-  connect('agent-02', 'agent-03', 'e-02-03', 'POST /handoff → ADR decision');
-  connect('agent-03', 'agent-04', 'e-03-04', 'POST /handoff → Code artifact');
-  connect('agent-05', 'agent-10', 'e-05-10', 'POST /handoff → CVE patterns');
-  connect('agent-10', 'agent-15', 'e-10-15', 'POST /report → Debug analysis');
-  connect('agent-14', 'agent-07', 'e-14-07', 'POST /handoff → Updated manifest');
-  connect('agent-07', 'agent-11', 'e-07-11', 'POST /handoff → Deploy complete');
-  connect('agent-11', 'agent-15', 'e-11-15', 'POST /report → Perf baseline');
-  connect('agent-15', 'orchestrator', 'e-15-orch', 'POST /report → Exam complete');
-  connect('agent-16', 'agent-15', 'e-16-15', 'POST /report → Kill logged');
-
-  return e;
-};
-
-const FLOW_OPTIONS: { id: ActiveFlow; label: string; desc: string; color: string }[] = [
-  { id: 'research_to_code', label: '🔬 Research → Code', desc: 'Full feature build pipeline', color: '#06b6d4' },
-  { id: 'security_sweep',   label: '🛡️ Security Sweep',  desc: 'CVE scan + debug analysis', color: '#ef4444' },
-  { id: 'devops_deploy',    label: '📦 DevOps Deploy',   desc: 'Deps + deploy + perf check', color: '#f97316' },
-  { id: 'examination_eval', label: '🔎 Full Examination', desc: 'Evaluation of all agents',  color: '#34d399' },
-  { id: 'system_guardian',  label: '🖥️ System Guardian',  desc: 'macOS process monitor + kill', color: '#e879f9' },
-];
 
 const s = {
   bar: {
@@ -206,23 +115,6 @@ const s = {
     width: '1px', height: '24px',
     background: 'var(--border-bright)', margin: '0 16px',
   },
-  flowBtn: (active: boolean, color: string) => ({
-    padding: '8px 16px', borderRadius: '16px', border: '1px solid',
-    fontSize: '10px', fontWeight: 900, textTransform: 'uppercase' as const,
-    letterSpacing: '0.05em', cursor: 'pointer',
-    transition: 'all 0.3s',
-    background: active ? '#fff' : 'var(--glass-bg)',
-    borderColor: active ? `${color}40` : 'var(--border)',
-    color: active ? '#7c3aed' : 'var(--text-dim)',
-    boxShadow: active ? `0 0 0 4px ${color}15` : 'none',
-    outline: 'none',
-  }),
-  resetBtn: {
-    padding: '8px 12px', borderRadius: '16px', border: 'none',
-    fontSize: '10px', fontWeight: 700, cursor: 'pointer',
-    background: 'transparent', color: 'var(--text-muted)',
-    outline: 'none',
-  },
   terminalBtn: (active: boolean) => ({
     padding: '8px 16px', borderRadius: '16px', border: '1px solid',
     fontSize: '10px', fontWeight: 900, textTransform: 'uppercase' as const,
@@ -234,26 +126,433 @@ const s = {
   }),
 };
 
-function AnlagstavlanCanvas() {
-  const [allNodes] = useState(makeNodes());
-  const [allEdges] = useState(makeEdges());
+function TangleCanvas() {
+  const [allNodes, setAllNodes] = useState(makeNodes());
+  const [allEdges, setAllEdges] = useState<Edge[]>([]);
 
   const {
-    runFlow, activeFlow, visibleNodes, visibleEdges, is3DMode, intensity, resetVisibility
+    visibleNodes, visibleEdges, is3DMode, intensity, connectWs
   } = useAgentStore();
 
-  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([]);
+  const { screenToFlowPosition } = useReactFlow();
+
+  const [nodes, setNodes, _onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
   const [showTerminal, setShowTerminal] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
+  const [showIndex, setShowIndex] = useState(false);
+
+  // Sync dragged positions back to allNodes so localStorage saves them
+  const handleNodesChange = (changes: Parameters<typeof _onNodesChange>[0]) => {
+    _onNodesChange(changes);
+    setAllNodes(prev => {
+      let updated = prev;
+      for (const ch of changes) {
+        if (ch.type === 'position' && 'position' in ch && ch.position) {
+          updated = updated.map(n =>
+            n.id === ch.id ? { ...n, position: { ...n.position, ...ch.position } } : n
+          );
+        }
+      }
+      return updated;
+    });
+  };
+
+  // ─── Canvas drop & prompt state ────────────────────────────
+  const dragCounterRef = useRef(0);
+  const [isDragging, setIsDragging] = useState(false);
+  const [promptValue, setPromptValue] = useState('');
+  const [promptEntity, setPromptEntity] = useState('');
+  const [entityFilepaths, setEntityFilepaths] = useState<Record<string, string>>({});
+  const [isUploading, setIsUploading] = useState(false);
+  const [isMissionRunning, setIsMissionRunning] = useState(false);
+  const [missionEntity, setMissionEntity] = useState<string | null>(null);
+
+  // ─── localStorage persistence ─────────────────────────────
+  const initialLoadDone = useRef(false);
+  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Load persisted state on mount
+  useEffect(() => {
+    try {
+      const raw = localStorage.getItem(LS_KEY);
+      if (!raw) return;
+      const saved = JSON.parse(raw);
+      if (!saved || typeof saved !== 'object') return;
+
+      // Restore dynamic nodes (merge with static nodes from makeNodes)
+      if (Array.isArray(saved.nodes)) {
+        const staticNodes = makeNodes();
+        const restoredNodes: Node[] = saved.nodes
+          .filter((n: Node) => !STATIC_NODE_IDS.has(n.id))
+          .map((n: Node) => {
+            // Reset pipeline nodes stuck in active states
+            if (n.type === 'pipeline' && (n.data as PipelineNodeData)?.agentId) {
+              const agentId = (n.data as PipelineNodeData).agentId;
+              const storeStatus = useAgentStore.getState().agentStatuses[agentId];
+              if (storeStatus && storeStatus !== 'idle' && storeStatus !== 'done' && storeStatus !== 'error') {
+                useAgentStore.getState().setAgentStatus(agentId, 'idle');
+              }
+            }
+            // Reset entity nodes stuck in 'running'
+            if (n.type === 'entity' && (n.data as EntityNodeData)?.status === 'running') {
+              return { ...n, data: { ...n.data, status: 'idle' } as EntityNodeData };
+            }
+            return n;
+          });
+        setAllNodes([...staticNodes, ...restoredNodes]);
+      }
+
+      // Restore edges
+      if (Array.isArray(saved.edges)) {
+        setAllEdges(saved.edges as Edge[]);
+      }
+
+      // Restore entityFilepaths
+      if (saved.entityFilepaths && typeof saved.entityFilepaths === 'object') {
+        setEntityFilepaths(saved.entityFilepaths as Record<string, string>);
+      }
+    } catch {
+      // Corrupted localStorage — start fresh
+      localStorage.removeItem(LS_KEY);
+    }
+    initialLoadDone.current = true;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Save to localStorage (debounced) whenever dynamic state changes
+  useEffect(() => {
+    if (!initialLoadDone.current) return;
+
+    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = setTimeout(() => {
+      try {
+        const dynamicNodes = allNodes.filter(n => !STATIC_NODE_IDS.has(n.id));
+        const data = {
+          nodes: dynamicNodes,
+          edges: allEdges,
+          entityFilepaths,
+        };
+        localStorage.setItem(LS_KEY, JSON.stringify(data));
+      } catch {
+        // localStorage full or unavailable — silently ignore
+      }
+    }, 400);
+
+    return () => {
+      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
+    };
+  }, [allNodes, allEdges, entityFilepaths]);
 
   useEffect(() => {
-    const filteredNodes = allNodes.filter(n => visibleNodes.has(n.id) || n.id === 'orchestrator');
+    const filteredNodes = allNodes.filter(n =>
+      visibleNodes.has(n.id) ||
+      n.id === 'orchestrator' ||
+      ['source', 'entity', 'pipeline'].includes(n.type!)
+    );
     const filteredEdges = allEdges.filter(e => visibleEdges.has(e.id));
     setNodes(filteredNodes);
     setEdges(filteredEdges);
   }, [visibleNodes, visibleEdges, allNodes, allEdges, setNodes, setEdges]);
+
+  // ─── Drag & drop handlers ──────────────────────────────────
+  const handleDragOver = (e: React.DragEvent) => {
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+    dragCounterRef.current++;
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = (e: React.DragEvent) => {
+    e.preventDefault();
+    dragCounterRef.current--;
+    if (dragCounterRef.current <= 0) {
+      dragCounterRef.current = 0;
+      setIsDragging(false);
+    }
+  };
+
+  const handleDrop = async (e: React.DragEvent) => {
+    e.preventDefault();
+    setIsDragging(false);
+    const files = Array.from(e.dataTransfer.files);
+    if (files.length === 0) return;
+
+    const file = files[0];
+    const position = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+    const entityName = file.name.replace(/\.[^/.]+$/, '');
+
+    // Optimistic SourceNode
+    const sourceId = `source-${Date.now()}`;
+    const optNode: Node<SourceNodeData> = {
+      id: sourceId,
+      type: 'source',
+      position,
+      data: {
+        filename: file.name,
+        filepath: '',
+        entity: entityName,
+        confidence: 0,
+        chunkId: sourceId,
+        timestamp: new Date().toISOString(),
+        tags: [],
+      },
+      draggable: true,
+    };
+    setAllNodes(prev => [...prev, optNode]);
+
+    // Auto-fill prompt
+    setPromptValue(entityName);
+    setPromptEntity(entityName);
+    setIsUploading(true);
+
+    try {
+      const formData = new FormData();
+      formData.append('file', file);
+      formData.append('entity', entityName);
+
+      const res = await fetch('http://localhost:8000/api/upload', {
+        method: 'POST',
+        body: formData,
+      });
+      if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
+      const json = await res.json();
+
+      // Update SourceNode with real data
+      setAllNodes(prev => prev.map(n => {
+        if (n.id === sourceId) {
+          return {
+            ...n,
+            data: {
+              ...n.data,
+              filepath: json.filepath || '',
+              confidence: json.parsed?.confidence ?? 0.5,
+              chunkId: json.parsed?.chunk_id || sourceId,
+              timestamp: json.parsed?.timestamp || n.data.timestamp,
+              tags: json.parsed?.tags || [],
+              rawContent: json.parsed?.raw_content || '',
+              parseError: json.parsed?.parse_error || undefined,
+            } as SourceNodeData,
+          };
+        }
+        return n;
+      }));
+
+      setEntityFilepaths(prev => ({ ...prev, [entityName.toLowerCase()]: json.filepath || '' }));
+    } catch (err) {
+      console.error('Upload error:', err);
+    } finally {
+      setIsUploading(false);
+    }
+
+    // If folder: upload all remaining files
+    if (files.length > 1) {
+      for (let i = 1; i < files.length; i++) {
+        const f = files[i];
+        const fEntity = f.name.replace(/\.[^/.]+$/, '');
+        const fPos = screenToFlowPosition({
+          x: e.clientX + i * 40,
+          y: e.clientY + i * 30,
+        });
+        const fId = `source-${Date.now()}-${i}`;
+        setAllNodes(prev => [...prev, {
+          id: fId,
+          type: 'source',
+          position: fPos,
+          data: {
+            filename: f.name,
+            filepath: '',
+            entity: fEntity,
+            confidence: 0,
+            chunkId: fId,
+            timestamp: new Date().toISOString(),
+            tags: [],
+          } as SourceNodeData,
+          draggable: true,
+        }]);
+
+        // Upload in background (don't block main flow)
+        const fFormData = new FormData();
+        fFormData.append('file', f);
+        fFormData.append('entity', fEntity);
+        fetch('http://localhost:8000/api/upload', { method: 'POST', body: fFormData })
+          .then(r => r.ok ? r.json() : null)
+          .then(json => {
+            if (!json) return;
+            setEntityFilepaths(prev => ({ ...prev, [fEntity.toLowerCase()]: json.filepath || '' }));
+            setAllNodes(prev => prev.map(n => {
+              if (n.id === fId) {
+                return {
+                  ...n,
+                  data: {
+                    ...n.data,
+                    filepath: json.filepath || '',
+                    confidence: json.parsed?.confidence ?? 0.5,
+                    chunkId: json.parsed?.chunk_id || fId,
+                    timestamp: json.parsed?.timestamp || (n.data as SourceNodeData).timestamp,
+                    tags: json.parsed?.tags || [],
+                    rawContent: json.parsed?.raw_content || '',
+                    parseError: json.parsed?.parse_error || undefined,
+                  } as SourceNodeData,
+                };
+              }
+              return n;
+            }));
+          })
+          .catch(err => console.error(`Upload error for ${f.name}:`, err));
+      }
+    }
+  };
+
+  // ─── Mission start handler ─────────────────────────────────
+  const handleStartMission = async (entity: string, existingFilepath?: string) => {
+    const finalEntity = entity || promptEntity || 'Unknown Entity';
+    const filepath = existingFilepath || entityFilepaths[finalEntity.toLowerCase()] || undefined;
+
+    setIsMissionRunning(true);
+    setMissionEntity(finalEntity);
+    setPromptEntity('');
+
+    // Hook up WebSocket for live pipeline status
+    connectWs();
+
+    // Compute entity node ID early so we can wire edges to it
+    const entityId = `entity-${finalEntity.toLowerCase().replace(/\s+/g, '-')}`;
+
+    // Remove old pipeline nodes/edges, create fresh ones
+    const pipelineSteps = ['planner', 'scout', 'librarian', 'critic', 'synthesizer'] as const;
+    const pipeEdges = [
+      { id: 'pipe-ent-p',   source: entityId,  target: 'planner', animated: true },
+      { id: 'pipe-p-s',      source: 'planner', target: 'scout', animated: true },
+      { id: 'pipe-p-l',      source: 'planner', target: 'librarian', animated: true },
+      { id: 'pipe-s-c',      source: 'scout', target: 'critic', animated: true },
+      { id: 'pipe-l-c',      source: 'librarian', target: 'critic', animated: true },
+      { id: 'pipe-c-syn',    source: 'critic', target: 'synthesizer', animated: true },
+      { id: 'pipe-syn-orch', source: 'synthesizer', target: 'orchestrator', animated: true },
+    ];
+
+    // Branch layout: Planner → Scout + Librarian (parallel) → Critic → Synthesizer
+    const pipePositions: Record<string, { x: number; y: number }> = {
+      planner:     { x: 80,  y: 340 },
+      scout:       { x: 280, y: 220 },
+      librarian:   { x: 280, y: 460 },
+      critic:      { x: 500, y: 340 },
+      synthesizer: { x: 720, y: 340 },
+    };
+
+    setAllNodes(prev => {
+      const cleaned = prev.filter(n => !pipelineSteps.includes(n.id as typeof pipelineSteps[number]));
+      const newNodes: Node<PipelineNodeData>[] = pipelineSteps.map(step => ({
+        id: step,
+        type: 'pipeline',
+        position: pipePositions[step],
+        data: {
+          agentId: step,
+          step,
+          label: step.charAt(0).toUpperCase() + step.slice(1),
+        },
+        draggable: true,
+      }));
+      return [...cleaned, ...newNodes];
+    });
+
+    setAllEdges(prev => {
+      const cleaned = prev.filter(e => !e.id.startsWith('pipe-'));
+      const newEdges: Edge[] = pipeEdges.map(pe => ({
+        id: pe.id,
+        source: pe.source,
+        target: pe.target,
+        type: 'telemetry',
+        animated: true,
+        style: { stroke: 'rgba(139,92,246,0.15)', strokeWidth: 1.5 },
+        markerEnd: { type: MarkerType.ArrowClosed, color: 'rgba(139,92,246,0.3)', width: 8, height: 8 },
+        data: { edgeId: pe.id, label: '', sourceId: pe.source, targetId: pe.target },
+      }));
+      return [...cleaned, ...newEdges];
+    });
+
+    // Create/update EntityNode
+    const existingEntityIdx = allNodes.findIndex(n => n.id === entityId);
+
+    if (existingEntityIdx >= 0) {
+      setAllNodes(prev => prev.map(n => {
+        if (n.id === entityId) {
+          return {
+            ...n,
+            data: { ...n.data, status: 'running', filepath: filepath || (n.data as unknown as EntityNodeData).filepath } as EntityNodeData,
+          };
+        }
+        return n;
+      }));
+    } else {
+      const entityNode: Node<EntityNodeData> = {
+        id: entityId,
+        type: 'entity',
+        position: { x: 400, y: 180 },
+        data: { entity: finalEntity, status: 'running', filepath: filepath || undefined },
+        draggable: true,
+      };
+      setAllNodes(prev => [...prev, entityNode]);
+    }
+
+    try {
+      const body: Record<string, string> = { entity: finalEntity };
+      if (filepath) body.filepath = filepath;
+
+      const res = await fetch('http://localhost:8000/api/mission/start', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      if (!res.ok) throw new Error(`Mission failed: ${res.status}`);
+      const json = await res.json();
+
+      setAllNodes(prev => prev.map(n => {
+        if (n.id === entityId) {
+          return {
+            ...n,
+            data: {
+              ...n.data,
+              status: 'done',
+              report: json.report,
+              reportMarkdown: json.report_markdown || json.report,
+              verified: json.verified,
+              criticScore: json.critic_score,
+            } as EntityNodeData,
+          };
+        }
+        return n;
+      }));
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      setAllNodes(prev => prev.map(n => {
+        if (n.id === entityId) {
+          return {
+            ...n,
+            data: {
+              ...n.data,
+              status: 'error',
+              errorMessage: msg,
+            } as EntityNodeData,
+          };
+        }
+        return n;
+      }));
+    } finally {
+      setIsMissionRunning(false);
+      setMissionEntity(null);
+      setPromptEntity('');
+    }
+  };
+
+  const handlePromptSubmit = (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = promptValue.trim();
+    if (!trimmed) return;
+    handleStartMission(trimmed);
+    setPromptValue('');
+  };
 
   return (
     <div style={{ width: '100vw', height: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--void)' }}>
@@ -265,35 +564,35 @@ function AnlagstavlanCanvas() {
         <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
           <div style={{ fontSize: '24px' }}>🦅</div>
           <div>
-            <h1 style={s.title}>ANLAGSTAVLAN</h1>
-            <p style={s.subtitle}>Tactical Strategy Engine</p>
+            <h1 style={s.title}>TANGLE</h1>
+            <p style={s.subtitle}>Untangle the world</p>
           </div>
         </div>
 
         <div style={s.divider} />
 
-        <div style={{ display: 'flex', gap: '8px', flex: 1 }}>
-          {FLOW_OPTIONS.map(flow => (
-            <button
-              key={flow.id}
-              onClick={() => runFlow(flow.id)}
-              style={s.flowBtn(activeFlow === flow.id, flow.color)}
-            >
-              {flow.label}
-            </button>
-          ))}
-          <button onClick={resetVisibility} style={s.resetBtn}>RESET</button>
-        </div>
+        <div style={{ flex: 1 }} />
 
         <div style={{ display: 'flex', gap: 6 }}>
           <button
-            onClick={() => { setShowTerminal(!showTerminal); if (!showTerminal) setShowLogs(false); }}
+            onClick={() => { setShowIndex(!showIndex); if (!showIndex) { setShowTerminal(false); setShowLogs(false); } }}
+            style={{
+              ...s.terminalBtn(showIndex),
+              borderColor: showIndex ? '#a855f760' : 'var(--border)',
+              color: showIndex ? '#a855f7' : 'var(--text-dim)',
+            }}
+            title="Memory index — live snapshot of SQLite, Qdrant, Supabase, filesystem"
+          >
+            INDEX
+          </button>
+          <button
+            onClick={() => { setShowTerminal(!showTerminal); if (!showTerminal) { setShowLogs(false); setShowIndex(false); } }}
             style={s.terminalBtn(showTerminal)}
           >
             CLI
           </button>
           <button
-            onClick={() => { setShowLogs(!showLogs); if (!showLogs) setShowTerminal(false); }}
+            onClick={() => { setShowLogs(!showLogs); if (!showLogs) { setShowTerminal(false); setShowIndex(false); } }}
             style={{
               ...s.terminalBtn(showLogs),
               borderColor: showLogs ? '#06b6d460' : 'var(--border)',
@@ -311,18 +610,165 @@ function AnlagstavlanCanvas() {
           <ReactFlow
             nodes={nodes}
             edges={edges}
-            onNodesChange={onNodesChange}
+            onNodesChange={handleNodesChange}
             onEdgesChange={onEdgesChange}
             nodeTypes={NODE_TYPES}
             edgeTypes={EDGE_TYPES}
             colorMode="light"
             fitView
             fitViewOptions={{ padding: 0.5, duration: 800 }}
+            onDragOver={handleDragOver}
+            onDragLeave={handleDragLeave}
+            onDrop={handleDrop}
           >
             <Background variant={BackgroundVariant.Lines} gap={60} size={1} color="rgba(0,0,0,0.02)" />
             <Controls />
             <MiniMap />
           </ReactFlow>
+
+          {/* ─── Drop Zone Overlay ──────────────────────────── */}
+          {isDragging && (
+            <div
+              style={{
+                position: 'absolute',
+                inset: 0,
+                zIndex: 100,
+                display: 'flex',
+                alignItems: 'center',
+                justifyContent: 'center',
+                background: 'rgba(139,92,246,0.08)',
+                backdropFilter: 'blur(4px)',
+                border: '2px dashed rgba(139,92,246,0.5)',
+                borderRadius: 16,
+                margin: 8,
+                pointerEvents: 'none',
+                transition: 'all 0.2s',
+              }}
+            >
+              <div style={{ textAlign: 'center' }}>
+                <div style={{ fontSize: 48, marginBottom: 12 }}>📂</div>
+                <div style={{
+                  fontSize: 18, fontWeight: 800,
+                  color: '#c084fc',
+                  letterSpacing: '-0.02em',
+                }}>
+                  Drop files here
+                </div>
+                <div style={{
+                  fontSize: 11, color: 'rgba(255,255,255,0.4)',
+                  marginTop: 6, fontFamily: 'JetBrains Mono, monospace',
+                }}>
+                  PDF · DOCX · XLSX · TXT · PNG · JPG
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* ─── Floating Prompt ────────────────────────────── */}
+          <form
+            onSubmit={handlePromptSubmit}
+            style={{
+              position: 'absolute',
+              bottom: 32,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 80,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              background: 'rgba(15,15,30,0.85)',
+              backdropFilter: 'blur(20px) saturate(180%)',
+              border: '1px solid rgba(255,255,255,0.1)',
+              borderRadius: 16,
+              padding: '6px 6px 6px 18px',
+              boxShadow: '0 8px 40px rgba(0,0,0,0.5), 0 0 0 1px rgba(139,92,246,0.1)',
+            }}
+          >
+            {promptEntity && !promptValue && (
+              <span style={{
+                fontSize: 11, fontWeight: 700,
+                color: '#c084fc',
+                background: 'rgba(139,92,246,0.12)',
+                padding: '3px 10px', borderRadius: 8,
+                border: '1px solid rgba(139,92,246,0.25)',
+              }}>
+                🎯 {promptEntity}
+              </span>
+            )}
+            <input
+              type="text"
+              value={promptValue}
+              onChange={(e) => setPromptValue(e.target.value)}
+              placeholder={
+                isUploading ? 'Uploading…' :
+                isMissionRunning ? `Helping ${missionEntity}…` :
+                'Help [entity]'
+              }
+              disabled={isUploading || isMissionRunning}
+              style={{
+                background: 'transparent',
+                border: 'none',
+                outline: 'none',
+                color: '#fff',
+                fontSize: 14,
+                fontWeight: 600,
+                fontFamily: 'JetBrains Mono, monospace',
+                width: 220,
+              }}
+            />
+            <button
+              type="submit"
+              disabled={isUploading || isMissionRunning || !promptValue.trim()}
+              style={{
+                padding: '8px 18px',
+                borderRadius: 12,
+                border: 'none',
+                background: promptValue.trim()
+                  ? 'linear-gradient(135deg, #8b5cf6, #06b6d4)'
+                  : 'rgba(255,255,255,0.06)',
+                color: promptValue.trim() ? '#fff' : 'rgba(255,255,255,0.3)',
+                fontSize: 12,
+                fontWeight: 700,
+                cursor: promptValue.trim() && !isUploading && !isMissionRunning ? 'pointer' : 'default',
+                transition: 'all 0.3s',
+                letterSpacing: '0.02em',
+              }}
+            >
+              {isUploading ? '⏳' : isMissionRunning ? '⚡' : '🚀'}
+            </button>
+          </form>
+
+          {/* Upload status indicator */}
+          {isUploading && (
+            <div style={{
+              position: 'absolute',
+              top: 20,
+              left: '50%',
+              transform: 'translateX(-50%)',
+              zIndex: 80,
+              display: 'flex',
+              alignItems: 'center',
+              gap: 8,
+              background: 'rgba(15,15,30,0.85)',
+              backdropFilter: 'blur(12px)',
+              border: '1px solid rgba(245,158,11,0.3)',
+              borderRadius: 10,
+              padding: '8px 20px',
+            }}>
+              <div style={{
+                width: 6, height: 6, borderRadius: '50%',
+                background: '#f59e0b',
+                animation: 'pulse-glow 1s ease-in-out infinite',
+              }} />
+              <span style={{
+                fontSize: 11, fontWeight: 700,
+                color: '#f59e0b',
+                fontFamily: 'JetBrains Mono, monospace',
+              }}>
+                Uploading file…
+              </span>
+            </div>
+          )}
         </div>
 
         {/* Side panel */}
@@ -333,16 +779,21 @@ function AnlagstavlanCanvas() {
             transition: 'width 0.3s',
             overflow: 'hidden',
             flexShrink: 0,
-            width: showTerminal || showLogs ? 520 : 0,
+            width: showTerminal || showLogs || showIndex ? SIDE_PANEL_WIDTH : 0,
           }}
         >
+          {showIndex && (
+            <div style={{ width: SIDE_PANEL_WIDTH, height: '100%', overflow: 'hidden' }}>
+              <IndexPanel />
+            </div>
+          )}
           {showTerminal && (
-            <div style={{ width: 520, height: '100%', overflow: 'hidden' }}>
+            <div style={{ width: SIDE_PANEL_WIDTH, height: '100%', overflow: 'hidden' }}>
               <CliHarness />
             </div>
           )}
           {showLogs && (
-            <div style={{ width: 520, height: '100%', overflow: 'hidden' }}>
+            <div style={{ width: SIDE_PANEL_WIDTH, height: '100%', overflow: 'hidden' }}>
               <AgentVerbosePanel />
             </div>
           )}
@@ -355,7 +806,7 @@ function AnlagstavlanCanvas() {
 export default function App() {
   return (
     <ReactFlowProvider>
-      <AnlagstavlanCanvas />
+      <TangleCanvas />
     </ReactFlowProvider>
   );
 }

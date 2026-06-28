@@ -13,6 +13,7 @@ import httpx
 from free_gateway import FreeGateway
 from parsing_engine import ParsingEngine
 from vector_store import VectorStore
+from wiki_vault import WikiVault, export_on_mission_enabled
 
 logger = logging.getLogger("tangle.orchestrator")
 
@@ -44,6 +45,7 @@ class AgentOrchestrator:
         self.gateway = gateway
         self.parser = ParsingEngine(gateway=gateway)
         self.vector_store = VectorStore()
+        self.wiki_vault = WikiVault()
         self.callbacks: List[Callable[[Dict], None]] = []
         self._running = False
         self._current_mission_id: Optional[str] = None  # threaded to gateway for cost tracking
@@ -322,6 +324,7 @@ class AgentOrchestrator:
                 confidence=confidence,
                 chunk_id=chunk_id,
                 body=wiki_body,
+                tags=self._extract_tags_from_body(wiki_body),
             )
 
             self._emit({
@@ -376,8 +379,18 @@ class AgentOrchestrator:
         confidence: float,
         chunk_id: str,
         body: str,
+        tags: Optional[List[str]] = None,
     ) -> str:
-        """Wrap the LLM-produced wiki body with deterministic metadata headers per the TANGLE wiki spec."""
+        """Wrap the LLM-produced wiki body with deterministic metadata headers per the TANGLE wiki spec.
+
+        `tags` is the list of tag tokens (without the leading #). When empty/None,
+        the synthesized entry is tagged '#synthesized' so vault consumers can
+        distinguish LLM-generated from user-uploaded chunks. Real tags from the
+        synth output override the fallback.
+        """
+        if not tags:
+            tags = ["synthesized"]
+        tag_line = " ".join(f"#{t}" for t in tags)
         return (
             f"# Entity: {entity_name}\n"
             f"## Source: {source_filename}\n"
@@ -388,8 +401,26 @@ class AgentOrchestrator:
             f"### Related Chunks\n"
             f"- [[source-file:{source_filename}]]\n\n"
             f"### Tags\n"
-            f"- #synthesized\n"
+            f"- {tag_line}\n"
         )
+
+    @staticmethod
+    def _extract_tags_from_body(body: str) -> List[str]:
+        """Extract #tags from the synthesized wiki body. Same regex shape as
+        parsing_engine so the two stay consistent."""
+        if not body:
+            return []
+        # Match hashtags at word boundaries (avoid C#, F#, etc.)
+        found = re.findall(r"(?:^|\s)#([a-z0-9][a-z0-9_-]{1,30})", body.lower())
+        seen: set = set()
+        unique: List[str] = []
+        for t in found:
+            if t not in seen:
+                seen.add(t)
+                unique.append(t)
+            if len(unique) >= 8:
+                break
+        return unique
 
     @staticmethod
     def _confidence_from_critic(critic_score: Optional[float], verified: bool) -> float:
@@ -511,6 +542,22 @@ class AgentOrchestrator:
         # Pull usage stats for this mission from the gateway
         usage = self.gateway.get_mission_usage(mission_id) if hasattr(self.gateway, "get_mission_usage") else {}
 
+        # Refresh the Obsidian-compatible wiki vault so docs/wiki/ stays in sync
+        # with whatever just landed in SQLite (original upload + synthesized entry).
+        # Best-effort: a vault export failure must not break the mission response.
+        wiki_export_summary: Optional[Dict[str, Any]] = None
+        if export_on_mission_enabled():
+            try:
+                wiki_export_summary = self.wiki_vault.export_all()
+                self._emit({
+                    "type": "wiki_vault_exported",
+                    "vault_root": wiki_export_summary.get("vault_root"),
+                    "chunks": wiki_export_summary.get("chunks"),
+                    "entities": wiki_export_summary.get("entities"),
+                })
+            except Exception as e:
+                logger.warning(f"Wiki vault auto-export after mission failed: {e}")
+
         self._running = False
         return {
             "mission_id": mission_id,
@@ -527,6 +574,7 @@ class AgentOrchestrator:
             "critic_score": evaluation.get("score"),
             "critic_critique": evaluation.get("critique"),
             "usage": usage,
+            "wiki_export": wiki_export_summary,
         }
 
     async def execute(self, agent_id: str, task: str, max_turns: int = 6) -> dict:

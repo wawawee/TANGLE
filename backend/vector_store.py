@@ -3,6 +3,7 @@
 import os
 import sqlite3
 import logging
+from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 import httpx
 
@@ -246,7 +247,7 @@ class VectorStore:
         cursor = conn.cursor()
         cursor.execute(
             "INSERT OR REPLACE INTO missions VALUES (?, ?, ?, ?, ?)",
-            (mission_id, entity_name, status, report, datetime.utcnow().isoformat() + "Z")
+            (mission_id, entity_name, status, report, datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
         )
         conn.commit()
         conn.close()
