@@ -65,6 +65,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--entity", type=str, default=None, help="Only re-seed entries for this entity_name")
     p.add_argument("--skip-qdrant", action="store_true", help="Skip Qdrant re-upsert")
     p.add_argument("--skip-supabase", action="store_true", help="Skip Supabase re-upsert")
+    p.add_argument("--cleanup-entities", type=str, default=None,
+                   help="Comma-separated entity_name values to DELETE from SQLite + Qdrant + Supabase")
+    p.add_argument("--yes", action="store_true", help="Skip confirmation prompt for --cleanup-entities")
     return p.parse_args()
 
 
@@ -152,6 +155,50 @@ async def reseed_one(store: VectorStore, entry: dict, args: argparse.Namespace) 
         return False, f"{type(e).__name__}: {e}"
 
 
+async def cleanup_entities(store: VectorStore, targets: list[str]) -> int:
+    """Delete entities from SQLite (source of truth) + Qdrant + Supabase."""
+    print()
+    # 1. SQLite — source of truth
+    conn = sqlite3.connect(str(DB_PATH))
+    cur = conn.cursor()
+    placeholders = ",".join("?" for _ in targets)
+    cur.execute(f"SELECT chunk_id, entity_name FROM wiki_entries WHERE entity_name IN ({placeholders})", targets)
+    rows = cur.fetchall()
+    print(f"SQLite: {len(rows)} chunks match")
+    cur.execute(f"DELETE FROM wiki_entries WHERE entity_name IN ({placeholders})", targets)
+    cur.execute(f"DELETE FROM missions WHERE entity_name IN ({placeholders})", targets)
+    conn.commit()
+    conn.close()
+    print(f"  ✓ SQLite: deleted from wiki_entries + missions")
+
+    # 2. Qdrant — delete by entity_name filter
+    if store.qclient:
+        try:
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+            for entity in targets:
+                store.qclient.delete(
+                    collection_name=COLLECTION_NAME,
+                    points_selector=Filter(must=[
+                        FieldCondition(key="entity_name", match=MatchValue(value=entity))
+                    ]),
+                )
+            print(f"  ✓ Qdrant: deleted points for {len(targets)} entities")
+        except Exception as e:
+            print(f"  ✗ Qdrant delete failed: {e}")
+
+    # 3. Supabase
+    if store.supabase:
+        try:
+            for entity in targets:
+                store.supabase.table("wiki_entries").delete().eq("entity_name", entity).execute()
+            print(f"  ✓ Supabase: deleted rows for {len(targets)} entities")
+        except Exception as e:
+            print(f"  ✗ Supabase delete failed: {e}")
+
+    print("\nDone.")
+    return 0
+
+
 async def main_async(args: argparse.Namespace) -> int:
     print(f"DB: {DB_PATH}")
     entries = load_entries(DB_PATH, args.entity)
@@ -177,6 +224,21 @@ async def main_async(args: argparse.Namespace) -> int:
         if len(entries) > 3:
             print(f"  ... and {len(entries) - 3} more")
         return 0
+
+    # Handle cleanup-entities if requested (mutually exclusive with re-seed)
+    if args.cleanup_entities is not None:
+        targets = [e.strip() for e in args.cleanup_entities.split(",") if e.strip()]
+        if not targets:
+            print("No cleanup targets given.")
+            return 1
+        print(f"--- Cleanup: deleting {len(targets)} entities ---")
+        for e in targets:
+            n = sum(1 for x in entries if x["entity_name"] == e)
+            print(f"  - {e}  ({n} chunks)")
+        if not args.yes:
+            print("\nRefusing to delete without --yes flag. Re-run with --yes to confirm.")
+            return 1
+        return await cleanup_entities(store, targets)
 
     # Drop Qdrant collection (skippable)
     if not args.skip_qdrant:
