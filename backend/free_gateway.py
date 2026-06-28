@@ -8,21 +8,29 @@ OPENROUTER_BASE = "https://openrouter.ai/api/v1"
 GEMINI_BASE = "https://generativelanguage.googleapis.com/v1beta"
 OLLAMA_BASE = "http://localhost:11434"
 
+# Verified against https://openrouter.ai/api/v1/models on 2026-06-28.
+# Drop entries here only after confirming they are gone from the live API --
+# each one in the chain is a retry attempt that costs quota if dead.
 OPENROUTER_FREE_MODELS = [
-    "meta-llama/llama-3.3-70b-instruct:free",
-    "google/gemma-4-26b-a4b-it:free",
-    "deepseek/deepseek-v4-flash:free",
-    "qwen/qwen3-coder:free",
-    "minimax/minimax-m2.5:free",
-    "nvidia/nemotron-3-super-120b-a12b:free",
-    "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",
-    "openai/gpt-oss-120b:free",
-    "google/gemma-4-31b-it:free",
-    "arcee-ai/trinity-large-thinking:free",
-    "qwen/qwen3-next-80b-a3b-instruct:free",
-    "nvidia/nemotron-nano-12b-v2-vl:free",
-    "poolside/laguna-m.1:free",
-    "nousresearch/hermes-3-llama-3.1-405b:free",
+    # Tier 1: Best defaults (retry order -- best first)
+    "qwen/qwen3-coder:free",                          # coding king, 1M ctx
+    "nvidia/nemotron-3-ultra-550b-a55b:free",         # reasoning king, 1M ctx
+    "openai/gpt-oss-120b:free",                       # tool-calling + structured JSON, Apache 2.0
+    "meta-llama/llama-3.3-70b-instruct:free",         # stable all-rounder (orchestrator default)
+    "poolside/laguna-m.1:free",                       # agentic coding specialist
+    "openrouter/owl-alpha",                           # native tool-use, 1M ctx
+    # Tier 2: Specialists
+    "nvidia/nemotron-3-super-120b-a12b:free",         # hybrid MoE
+    "cohere/north-mini-code:free",                    # agentic coding MoE
+    "qwen/qwen3-next-80b-a3b-instruct:free",          # fast + long ctx
+    "google/gemma-4-31b-it:free",                     # multimodal (text+image)
+    "google/gemma-4-26b-a4b-it:free",                 # MoE multimodal
+    "nvidia/nemotron-nano-12b-v2-vl:free",            # vision default (parsing_engine)
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning:free",  # perception sub-agent
+    "nousresearch/hermes-3-llama-3.1-405b:free",      # stable long-time fallback
+    "meta-llama/llama-3.2-3b-instruct:free",          # small + fast bulk fallback
+    # Tier 3: Last resort
+    "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",  # uncensored (use last)
 ]
 
 OLLAMA_CHAT_MODELS = ["llama3.2:3b", "llama3.1:8b", "qwen3:8b", "llama3.2:1b", "phi4-mini:3.8b"]
@@ -143,10 +151,22 @@ class FreeGateway:
 
     async def _try_other_free_models(self, failed_model: str, messages: list[dict], tools: Optional[list] = None) -> dict:
         for fallback_model in OPENROUTER_FREE_MODELS:
-            stripped = fallback_model.removesuffix(":free")
-            if fallback_model == failed_model or stripped == failed_model:
+            # Normalize: strip optional "openrouter/" prefix (for entries like openrouter/owl-alpha
+            # whose ID does NOT carry a :free suffix), and strip optional :free suffix.
+            normalized = fallback_model
+            if normalized.startswith("openrouter/"):
+                normalized = normalized[len("openrouter/"):]
+            normalized = normalized.removesuffix(":free")
+
+            # Skip the model that just failed
+            failed_normalized = failed_model
+            if failed_normalized.startswith("openrouter/"):
+                failed_normalized = failed_normalized[len("openrouter/"):]
+            failed_normalized = failed_normalized.removesuffix(":free")
+            if normalized == failed_normalized:
                 continue
-            result = await self._call_single_openrouter(fallback_model, messages, tools)
+
+            result = await self._call_single_openrouter(normalized, messages, tools)
             if "error" not in result:
                 return result
         return await self._fallback_to_gemini(failed_model, messages)
