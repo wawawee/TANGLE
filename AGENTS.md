@@ -205,9 +205,10 @@ What's done:
 - ✅ Auto-tagging via LLM tag-extraction (semantic taxonomy, not just placeholder)
 
 Known gaps (Phase 0.1):
-- ⚠️ Synth report renders as plain text in side panel — no real markdown renderer yet
+- ✅ Synth report markdown rendering — DONE (EntityNode uses ReactMarkdown + remark-gfm + full CSS for h1-h3/p/ul/code/pre/blockquote, 2026-06-28)
+- ✅ Live end-to-end test — DONE (`scripts/eval_gates.py` runs 8 pass/fail checks against backend/Supabase/Qdrant/Ollama; `scripts/smoke_test.py` runs a full upload→mission→wiki-JSON mission)
+- ✅ Unit tests — 87 tests covering embedding setup + free-gateway + parsing + wiki-vault, all passing in 0.5s
 - ⚠️ Old `.sami-history/` / `.sami-kanban.json` / `sami.db` paths were renamed to `.tangle-*` / `tangle.db` in code, but no migration for any pre-existing data files (none expected — fresh project)
-- ⚠️ No live end-to-end test committed yet
 
 ---
 

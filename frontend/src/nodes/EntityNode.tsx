@@ -34,9 +34,29 @@ const STATUS_LABELS: Record<string, { label: string; color: string }> = {
 const EntityNode = memo(({ data }: NodeProps) => {
   const nodeData = data as unknown as EntityNodeData;
   const [expanded, setExpanded] = useState(false);
+  const [showFullReport, setShowFullReport] = useState(false);
+  const [copyState, setCopyState] = useState<'idle' | 'ok' | 'fail'>('idle');
   const statusCfg = STATUS_LABELS[nodeData.status] || STATUS_LABELS.idle;
   const icon = guessIcon(nodeData.entity);
   const isActive = nodeData.status === 'running' || nodeData.status === 'uploading';
+
+  const handleCopyReport = async (e: React.MouseEvent) => {
+    e.stopPropagation();
+    const md = nodeData.reportMarkdown || nodeData.report || '';
+    try {
+      await navigator.clipboard.writeText(md);
+      setCopyState('ok');
+      setTimeout(() => setCopyState('idle'), 1500);
+    } catch {
+      setCopyState('fail');
+      setTimeout(() => setCopyState('idle'), 1500);
+    }
+  };
+
+  const handleToggleFull = (e: React.MouseEvent) => {
+    e.stopPropagation();
+    setShowFullReport(s => !s);
+  };
 
   return (
     <div
@@ -175,18 +195,45 @@ const EntityNode = memo(({ data }: NodeProps) => {
             <div
               className="tangle-markdown-report"
               style={{
-                maxHeight: 320, overflowY: 'auto',
+                maxHeight: showFullReport ? 600 : 280, overflowY: 'auto',
                 background: 'rgba(255,255,255,0.03)',
                 padding: '10px 12px', borderRadius: 8,
               }}
             >
               <ReactMarkdown remarkPlugins={[remarkGfm]}>
-                {nodeData.reportMarkdown.slice(0, 3000)}
+                {showFullReport ? (nodeData.reportMarkdown || '') : (nodeData.reportMarkdown || '').slice(0, 1200)}
               </ReactMarkdown>
-              {nodeData.reportMarkdown.length > 3000 && (
-                <p style={{ fontSize: 9, color: 'rgba(255,255,255,0.2)', fontStyle: 'italic', marginTop: 8 }}>
-                  …truncated ({nodeData.reportMarkdown.length - 3000} more chars in full report)
-                </p>
+            </div>
+            <div style={{ display: 'flex', gap: 6, marginTop: 8, alignItems: 'center' }}>
+              <button
+                onClick={handleCopyReport}
+                title="Copy full report to clipboard"
+                style={{
+                  flex: 1, padding: '5px 0', fontSize: 9, fontWeight: 600,
+                  textTransform: 'uppercase', letterSpacing: '0.08em',
+                  background: copyState === 'ok' ? 'rgba(16,185,129,0.18)' : 'rgba(139,92,246,0.18)',
+                  border: `1px solid ${copyState === 'ok' ? 'rgba(16,185,129,0.4)' : 'rgba(139,92,246,0.35)'}`,
+                  borderRadius: 6, color: copyState === 'ok' ? '#10b981' : '#c084fc',
+                  cursor: 'pointer', fontFamily: 'inherit',
+                  transition: 'background 120ms, color 120ms',
+                }}
+              >
+                {copyState === 'ok' ? '✓ Copied' : copyState === 'fail' ? '✗ Failed' : 'Copy'}
+              </button>
+              {(nodeData.reportMarkdown || '').length > 1200 && (
+                <button
+                  onClick={handleToggleFull}
+                  style={{
+                    flex: 1, padding: '5px 0', fontSize: 9, fontWeight: 600,
+                    textTransform: 'uppercase', letterSpacing: '0.08em',
+                    background: showFullReport ? 'rgba(239,68,68,0.18)' : 'rgba(255,255,255,0.04)',
+                    border: `1px solid ${showFullReport ? 'rgba(239,68,68,0.4)' : 'rgba(255,255,255,0.12)'}`,
+                    borderRadius: 6, color: showFullReport ? '#fca5a5' : 'rgba(255,255,255,0.5)',
+                    cursor: 'pointer', fontFamily: 'inherit',
+                  }}
+                >
+                  {showFullReport ? 'Collapse' : `Full (${(nodeData.reportMarkdown || '').length} chars)`}
+                </button>
               )}
             </div>
           </div>
