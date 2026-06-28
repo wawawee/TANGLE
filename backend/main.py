@@ -22,7 +22,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger("tangle.api")
 
-load_dotenv()
+# Load .env from repo root (parent of backend/) regardless of CWD
+load_dotenv(dotenv_path=Path(__file__).parent.parent / ".env")
 
 class AgentTask(BaseModel):
     agent_id: str
