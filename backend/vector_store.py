@@ -122,6 +122,24 @@ class VectorStore:
             "mission_id TEXT PRIMARY KEY, entity_name TEXT, "
             "status TEXT, report TEXT, timestamp TEXT"
             ");"
+            # pgvector column — added 2026-06-28 for Supabase vector search fallback.
+            # The extension (CREATE EXTENSION IF NOT EXISTS vector) and index
+            # must be created manually in Supabase SQL Editor (see .env.example).
+            # If the column doesn't exist yet, ALTER TABLE ADD COLUMN IF NOT EXISTS
+            # is idempotent and won't break the table probe.
+            "ALTER TABLE wiki_entries ADD COLUMN IF NOT EXISTS embedding vector(1536);"
+            # Search RPC function — called by _search_wiki_supabase() for
+            # pgvector cosine similarity search. Must exist for pgvector fallback.
+            "CREATE OR REPLACE FUNCTION search_wiki_entries("
+            "query_embedding vector(1536), match_entity text, match_limit int DEFAULT 5"
+            ") RETURNS TABLE(chunk_id text, entity_name text, filename text, "
+            "filepath text, raw_content text, markdown text, confidence real, "
+            "timestamp text, similarity float) LANGUAGE plpgsql AS $$ "
+            "BEGIN RETURN QUERY SELECT we.chunk_id, we.entity_name, we.filename, "
+            "we.filepath, we.raw_content, we.markdown, we.confidence, we.timestamp, "
+            "1 - (we.embedding <=> query_embedding) AS similarity "
+            "FROM wiki_entries we WHERE we.entity_name = match_entity "
+            "ORDER BY we.embedding <=> query_embedding LIMIT match_limit; END; $$;"
         )
         try:
             self.supabase.rpc("exec_sql", {"sql": ddl}).execute()
@@ -217,6 +235,15 @@ class VectorStore:
         # 2. Get embeddings
         vector = await self.get_embeddings(raw_content)
 
+        # 2b. Store embedding in Supabase for pgvector search (best-effort)
+        if self.supabase:
+            try:
+                self.supabase.table("wiki_entries").update(
+                    {"embedding": vector}
+                ).eq("chunk_id", chunk_id).execute()
+            except Exception as e:
+                logger.debug(f"Supabase embedding store skipped for {chunk_id}: {e}")
+
         # 3. Save to Vector Store (Qdrant)
         collection_name = "tangle_wiki_memories"
         if self.qclient:
@@ -252,6 +279,44 @@ class VectorStore:
                 self.memory_vectors.append({"vector": vector, "payload": {"chunk_id": chunk_id, "entity_name": entity_name, "content": raw_content}})
         else:
             self.memory_vectors.append({"vector": vector, "payload": {"chunk_id": chunk_id, "entity_name": entity_name, "content": raw_content}})
+
+    async def _search_wiki_supabase(self, vector: List[float], entity_name: str, limit: int = 5) -> List[Dict[str, Any]]:
+        """Search Supabase via pgvector cosine similarity (RPC fallback).
+
+        Requires the search_wiki_entries RPC function to exist in Supabase
+        (created by _init_supabase DDL or manually). Returns empty list on
+        any failure — caller falls back to SQLite keywords.
+        """
+        if not self.supabase:
+            return []
+        try:
+            resp = self.supabase.rpc(
+                "search_wiki_entries",
+                {
+                    "query_embedding": vector,
+                    "match_entity": entity_name,
+                    "match_limit": limit,
+                },
+            ).execute()
+            rows = resp.data or []
+            results: List[Dict[str, Any]] = []
+            for row in rows:
+                results.append({
+                    "chunk_id": row.get("chunk_id", ""),
+                    "entity_name": row.get("entity_name", entity_name),
+                    "filename": row.get("filename", ""),
+                    "filepath": row.get("filepath", ""),
+                    "raw_content": row.get("raw_content", ""),
+                    "markdown": row.get("markdown", ""),
+                    "confidence": row.get("confidence", 0.0),
+                    "timestamp": row.get("timestamp", ""),
+                })
+            if results:
+                logger.info(f"Supabase pgvector search found {len(results)} results for {entity_name}")
+            return results
+        except Exception as e:
+            logger.warning(f"Supabase pgvector search failed: {e}")
+            return []
 
     async def search_wiki(self, query: str, entity_name: str, limit: int = 5) -> List[Dict[str, Any]]:
         """Searches vector DB for chunks matching the query for a specific entity"""
@@ -296,8 +361,14 @@ class VectorStore:
                         })
                 return results
             except Exception as e:
-                logger.error(f"Qdrant search failed: {e}. Falling back to SQLite keywords.")
-        
+                logger.error(f"Qdrant search failed: {e}. Trying Supabase pgvector.")
+
+        # Supabase pgvector fallback (when Qdrant is down/unavailable)
+        if self.supabase:
+            results = await self._search_wiki_supabase(vector, entity_name, limit)
+            if results:
+                return results
+
         # SQLite Keyword fallback if Qdrant isn't working
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
