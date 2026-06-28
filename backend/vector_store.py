@@ -17,6 +17,32 @@ except ImportError:
     QDRANT_AVAILABLE = False
     logger.warning("qdrant-client not installed. Using in-memory fallback vector search.")
 
+# ── Supabase toggle ─────────────────────────────────────────
+SUPABASE_ENABLED = os.getenv("TANGLE_SUPABASE_ENABLED", "").strip() in ("1", "true", "True")
+SUPABASE_AVAILABLE = False
+_supabase_client = None
+if SUPABASE_ENABLED:
+    try:
+        from supabase import create_client, Client
+        _supabase_url = os.getenv("SUPABASE_URL", "")
+        _supabase_key = os.getenv("SUPABASE_ANON_KEY", "")
+        if _supabase_url and _supabase_key:
+            _supabase_client = create_client(_supabase_url, _supabase_key)
+            SUPABASE_AVAILABLE = True
+            logger.info(f"Supabase client initialized for {_supabase_url}")
+        else:
+            logger.warning(
+                "TANGLE_SUPABASE_ENABLED=1 but SUPABASE_URL or SUPABASE_ANON_KEY not set. "
+                "Supabase mirroring disabled."
+            )
+    except ImportError:
+        logger.warning(
+            "TANGLE_SUPABASE_ENABLED=1 but supabase-py not installed. "
+            "Install: pip install supabase"
+        )
+    except Exception as e:
+        logger.warning(f"Supabase client init failed: {e}. Supabase mirroring disabled.")
+
 class VectorStore:
     def __init__(self):
         self.qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
@@ -40,6 +66,9 @@ class VectorStore:
 
         # Fallback in-memory store for vectors
         self.memory_vectors = []
+        self.supabase = _supabase_client if SUPABASE_AVAILABLE else None
+        if self.supabase:
+            self._init_supabase()
 
     def _init_sqlite(self):
         """Initializes the local fallback SQLite database for relational state/wiki metadata"""
@@ -73,6 +102,40 @@ class VectorStore:
         
         conn.commit()
         conn.close()
+
+    def _init_supabase(self):
+        """Ensure Supabase tables exist (wiki_entries + missions).
+
+        Best-effort: tries RPC exec_sql first, falls back to probing
+        the tables. If tables don't exist, logs a warning with manual
+        SQL — writes will be skipped until tables are created.
+        """
+        if not self.supabase:
+            return
+        ddl = (
+            "CREATE TABLE IF NOT EXISTS wiki_entries ("
+            "chunk_id TEXT PRIMARY KEY, entity_name TEXT, filename TEXT, "
+            "filepath TEXT, raw_content TEXT, markdown TEXT, "
+            "confidence REAL, timestamp TEXT"
+            ");"
+            "CREATE TABLE IF NOT EXISTS missions ("
+            "mission_id TEXT PRIMARY KEY, entity_name TEXT, "
+            "status TEXT, report TEXT, timestamp TEXT"
+            ");"
+        )
+        try:
+            self.supabase.rpc("exec_sql", {"sql": ddl}).execute()
+            logger.info("Supabase wiki_entries table initialized")
+        except Exception:
+            try:
+                self.supabase.table("wiki_entries").select("chunk_id", count="exact").limit(0).execute()
+                logger.info("Supabase wiki_entries table already exists")
+            except Exception as e:
+                logger.warning(
+                    f"Supabase table init failed: {e}. "
+                    f"Create wiki_entries + missions tables manually in Supabase SQL Editor. "
+                    f"Writes will be skipped until tables exist."
+                )
 
     async def get_embeddings(self, text: str) -> List[float]:
         """Generates embedding vector for text using OpenRouter or fallback"""
@@ -124,7 +187,7 @@ class VectorStore:
         confidence = parsed_data["confidence"]
         timestamp = parsed_data["timestamp"]
 
-        # 1. Save to Relational DB (SQLite fallback, and optionally Supabase)
+        # 1. Save to Relational DB (SQLite — source of truth)
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
@@ -133,6 +196,23 @@ class VectorStore:
         )
         conn.commit()
         conn.close()
+
+        # 1b. Mirror to Supabase (best-effort, non-blocking)
+        if self.supabase:
+            try:
+                row = {
+                    "chunk_id": chunk_id,
+                    "entity_name": entity_name,
+                    "filename": filename,
+                    "filepath": filepath,
+                    "raw_content": raw_content,
+                    "markdown": markdown,
+                    "confidence": confidence,
+                    "timestamp": timestamp,
+                }
+                self.supabase.table("wiki_entries").upsert(row).execute()
+            except Exception as e:
+                logger.warning(f"Supabase wiki_entry mirror failed for {chunk_id}: {e}")
 
         # 2. Get embeddings
         vector = await self.get_embeddings(raw_content)
@@ -243,14 +323,29 @@ class VectorStore:
 
     def save_mission(self, mission_id: str, entity_name: str, report: str, status: str = "completed"):
         """Saves a help mission synthesized report"""
+        ts = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
             "INSERT OR REPLACE INTO missions VALUES (?, ?, ?, ?, ?)",
-            (mission_id, entity_name, status, report, datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+            (mission_id, entity_name, status, report, ts)
         )
         conn.commit()
         conn.close()
+
+        # Mirror to Supabase (best-effort, non-blocking)
+        if self.supabase:
+            try:
+                row = {
+                    "mission_id": mission_id,
+                    "entity_name": entity_name,
+                    "status": status,
+                    "report": report,
+                    "timestamp": ts,
+                }
+                self.supabase.table("missions").upsert(row).execute()
+            except Exception as e:
+                logger.warning(f"Supabase mission mirror failed for {mission_id}: {e}")
 
     def get_mission(self, mission_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves a help mission by ID"""
@@ -268,3 +363,35 @@ class VectorStore:
                 "timestamp": row[4]
             }
         return None
+
+    def get_supabase_stats(self) -> Dict[str, Any]:
+        """Return Supabase entry counts for the admin/index endpoint.
+
+        Returns counts from Supabase for wiki_entries and missions.
+        When Supabase is unavailable, returns zero counts with an error note.
+        """
+        stats: Dict[str, Any] = {
+            "wiki_entries_count": 0,
+            "missions_count": 0,
+            "by_entity": {},
+        }
+        if not self.supabase:
+            return stats
+        try:
+            wiki = self.supabase.table("wiki_entries").select("chunk_id,entity_name", count="exact").execute()
+            stats["wiki_entries_count"] = wiki.count or 0
+            if wiki.data:
+                by_entity: Dict[str, int] = {}
+                for row in wiki.data:
+                    en = row.get("entity_name", "unknown")
+                    by_entity[en] = by_entity.get(en, 0) + 1
+                stats["by_entity"] = by_entity
+            missions = self.supabase.table("missions").select("mission_id", count="exact").execute()
+            stats["missions_count"] = missions.count or 0
+        except Exception as e:
+            stats["error"] = str(e)
+        return stats
+
+    @property
+    def supabase_available(self) -> bool:
+        return self.supabase is not None

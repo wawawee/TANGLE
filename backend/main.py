@@ -707,17 +707,33 @@ async def admin_index():
     except Exception as e:
         qdrant_info["error"] = str(e)
 
-    # 3. Supabase — explicit not_connected per AGENTS.md Phase 1+ scope
+    # 3. Supabase — parallel cloud mirror when TANGLE_SUPABASE_ENABLED=1
     supabase_url = os.getenv("SUPABASE_URL", "")
     supabase_key = os.getenv("SUPABASE_ANON_KEY", "")
+    supabase_configured = bool(supabase_url and supabase_key)
+    supabase_enabled_flag = os.getenv("TANGLE_SUPABASE_ENABLED", "").strip() in ("1", "true", "True")
     supabase_info: Dict[str, Any] = {
-        "configured": bool(supabase_url and supabase_key),
+        "configured": supabase_configured,
+        "enabled": supabase_enabled_flag,
         "status": "not_connected",
-        "phase": "1+",
-        "note": "Backend integration deferred. Frontend stub node only. "
-                "See AGENTS.md 'What NOT to do (yet)'.",
         "entries_count": 0,
+        "missions_count": 0,
+        "by_entity": {},
     }
+    if supabase_configured and supabase_enabled_flag:
+        try:
+            sb_stats = orchestrator.vector_store.get_supabase_stats()
+            if sb_stats.get("error"):
+                supabase_info["status"] = "error"
+                supabase_info["error"] = sb_stats["error"]
+            else:
+                supabase_info["status"] = "connected"
+                supabase_info["entries_count"] = sb_stats["wiki_entries_count"]
+                supabase_info["missions_count"] = sb_stats["missions_count"]
+                supabase_info["by_entity"] = sb_stats["by_entity"]
+        except Exception as e:
+            supabase_info["status"] = "error"
+            supabase_info["error"] = str(e)
 
     # 4. Filesystem wiki vault
     fs_info: Dict[str, Any] = {
