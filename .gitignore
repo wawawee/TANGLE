@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Node
+node_modules/
+.next/
+dist/
+
+# LangGraph
+.checkpoint/
+
+# Archon
+.archon/runs/
+
+# Logs
+*.log
+logs/
+
+# Browser use
+.browser_use/
+
+# TANGLE runtime artifacts (don't commit user data)
+backend/tangle.db
+backend/venv/
+.mavis/
+.tangle-history/
+.tangle-kanban.json
+.tangle-plans/
+

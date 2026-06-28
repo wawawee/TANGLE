@@ -1,0 +1,220 @@
+# AGENTS.md — TANGLE
+
+> **Read this first.** You are working on **TANGLE**, an entity assistance intelligence. This file is the source of truth for project context, architecture, conventions, and what NOT to break.
+
+---
+
+## What TANGLE is
+
+TANGLE autonomously parses files, builds a vectorized wiki, runs an agent loop (planner → scout → librarian → critic → synthesizer), and emits a structured markdown report describing ways to help a named entity.
+
+**Mantra:** *The world is tangled. Information is tangled. Problems are tangled. We exist to untangle.*
+
+**Phase:** Phase 0 — The Skeleton. The pipeline runs end-to-end. Goal: drop a file, type "Help [Entity]", get a markdown report.
+
+---
+
+## Architecture principles
+
+How TANGLE grows. These are meta-rules that inform every convention below.
+
+1. **Background-first, React Flow for visualization.** External tools (Headroom, last30days, OpenViking, promptfoo, etc.) integrate as background workers — asyncio tasks, separate threads. They run silently. **If their data is interesting, expose it as a new React Flow node type** via `App.tsx NODE_TYPES` map. Never build a separate UI per tool.
+2. **Toggleable modules, not replacements.** New tools add capability alongside existing ones. Each module is feature-flagged via env var (e.g. `TANGLE_HEADROOM_ENABLED=1`). The old tool stays until the new one proves clearly superior across the board.
+3. **Discard if worthless.** If a module adds complexity without solving a real problem TANGLE has, remove it. Don't accumulate dead weight in the dependency tree.
+4. **Document before implementing.** New external tools go in `TASKLIST.md → EXTERNAL TOOL INTEGRATIONS` with phase tag first. Implementation only when the phase is reached. "Peu un peu."
+
+**Why:** TANGLE is a modular orchestration platform, not a monolithic pipeline. Each integration should be reversible (toggle off) and replaceable (swap implementation without rewriting callers).
+
+---
+
+## Architecture in one diagram
+
+```
+[React Flow Canvas]
+      │  uploadFile(file, entity)
+      ▼
+POST /api/upload  ──►  uploads/{filename}
+      │
+      ▼
+agent_orchestrator.ingest()
+      │
+      ├─► parsing_engine.parse_file()
+      │     ├─ PDF/DOCX/XLSX → markitdown
+      │     └─ Image        → vision dual-pass (cheap → premium)
+      │
+      └─► vector_store.add_wiki_entry()
+            ├─► SQLite (wiki_entries, missions)
+            └─► Qdrant collection: tangle_wiki_memories
+
+POST /api/mission/start  ──►  agent_orchestrator.run_mission()
+      │
+      ├─► ingest uploaded file (if any)
+      ├─► planner  → decompose into subtasks
+      ├─► scout    → DuckDuckGo + OpenRouter web fallback
+      ├─► librarian → vector search over wiki_entries
+      ├─► critic   → evaluation gate (LLM-as-judge, threshold 0.7)
+      └─► synthesizer → final markdown report with JSON wiki nodes block
+
+Frontend parses ```json ... ``` block from report → React Flow radiating layout
+```
+
+---
+
+## Wiki Markdown Spec (must follow)
+
+Every parsed chunk follows this exact structure. Frontend + downstream tools parse on these headings:
+
+```markdown
+# Entity: [Name]
+## Source: [Filename]
+### Extracted: [ISO Timestamp]
+### Confidence: [0.00–1.00]
+### Chunk ID: [uuid]
+
+[Raw content from source file...]
+
+### Related Chunks
+- [[vector-link-uuid]]
+- [[source-file-link]]
+
+### Tags
+- #health #finance #legal #contact #risk
+```
+
+Tags are placeholder taxonomy for now — the parser doesn't auto-tag yet. Future LLM call should produce tags based on content.
+
+---
+
+## Critical conventions
+
+### File paths
+- `TASKLIST.md` lives at **repo root** (not in backend/). `task_manager.py` resolves it as `parent.parent / "TASKLIST.md"`.
+- Run history: `<repo>/.tangle-history/runs.json`
+- Kanban state: `<repo>/.tangle-kanban.json`
+- SQLite: `backend/tangle.db`
+- Qdrant collection: `tangle_wiki_memories`
+
+### Naming
+- Logger names: `tangle.parser`, `tangle.vector`, `tangle.orchestrator`, `tangle.gateway`, `tangle.api`.
+- Brand text in UI: **TANGLE** (all-caps). Never Aegis, sami, or ANLAGSTAVLAN.
+
+### Backend module rules
+- All endpoints in `main.py`. New endpoints go here too — don't make new router files unless splitting gets truly needed.
+- Domain logic in `agent_orchestrator.py` (mission loop), `parsing_engine.py` (files → markdown), `vector_store.py` (storage), `free_gateway.py` (LLM routing).
+- All LLM calls go through `free_gateway.chat()`. **Never call OpenRouter/Gemini directly.**
+
+### Frontend module rules
+- One Zustand store: `frontend/src/store/agentStore.ts`. Add new state fields here.
+- React Flow node types: `source`, `entity`, `wiki`. New node types register in `App.tsx` NODE_TYPES map.
+- Components are unstyled-by-default (functional). Visual style lives in `index.css` token vars (`--cyan`, `--purple`, `--void`, etc.).
+
+### Cost discipline
+- Default model: cheapest free OpenRouter model that returns valid JSON.
+- Embeddings: `openai/text-embedding-3-small` via OpenRouter; SHA256 fallback if no key.
+- Vision: pass-1 cheap (e.g. `gemini-2.0-flash-exp` or `nvidia/nemotron-nano-12b-v2-vl:free`), pass-2 premium (`claude-3.5-sonnet`) **only when VITAL_INFO: TRUE**.
+- Ollama is the last-resort fallback for local-only mode.
+
+---
+
+## What is fragile (don't break)
+
+1. **`agent_orchestrator.run_mission()`** — this is the entire Phase 0 pipeline. Edit with care. Test by running `POST /api/mission/start` with a known entity name.
+2. **The wiki markdown structure** — downstream parsers (the JSON wiki-nodes regex in `agentStore.ts` line ~208) depend on ` ```json ` code blocks at the end of the synth report. Don't drop that.
+3. **`vector_store.add_wiki_entry()`** — collection name `tangle_wiki_memories` is used in 2 places (`add_wiki_entry` + `search_wiki`). Search will break if collection name desyncs.
+4. **The TASKLIST.md ↔ task_manager ↔ kanban_store ↔ run_history chain** — they all read/write the same root `TASKLIST.md`. Keep this single source of truth.
+
+---
+
+## What NOT to do (yet)
+
+These are explicit Phase 1+ scope. Don't pull them in:
+
+- ❌ Next.js migration (current Vite/React works fine — but see "Phase 1 candidates" below)
+- ❌ Supabase integration (SQLite is the fallback for now)
+- ❌ Redis / Celery (mission runs are synchronous and that's fine)
+- ❌ Multi-tenancy / auth (single-user local)
+- ❌ Mobile-first responsive (desktop only)
+- ❌ LangGraph as the orchestrator (we use `agent_orchestrator.py` directly — langgraph_engine.py exists for `/api/agents/lg/execute` but isn't the Phase 0 path)
+
+---
+
+## Phase 1 candidates (deliberately deferred)
+
+These would meaningfully improve the product but are **architectural rewrites**, not version bumps. Each is a 2-4 hour lift. Pick deliberately, not by accident.
+
+| Change | Current | Phase 1 option | Why it's not Phase 0 |
+|---|---|---|---|
+| Frontend framework | Vite + React 19 | **Next.js 16.2.9** + App Router | SSR adds auth/API-routes story we don't need yet |
+| Styling | Raw inline `style={}` props | **Tailwind CSS 4** | Would require rewriting every component |
+| State | Zustand (1 store) | Zustand + **TanStack Query 5** for server state | Overkill until we have a real backend with cacheable endpoints |
+| Validation | `pydantic` on backend only | **Zod 4** shared types frontend↔backend | Phase 0 has 3 endpoint shapes — premature |
+| Markdown render | Plain text in side panel | `react-markdown` + `remark-gfm` | Just renderer polish, low value |
+
+**Recommendation:** keep Vite for Phase 0. Revisit when Phase 1 has a real story (probably auth or multi-user).
+
+---
+
+## How to verify state
+
+```bash
+# Qdrant reachable
+curl http://localhost:6333/healthz
+
+# Backend health
+curl http://localhost:8000/health
+
+# Provider health
+curl http://localhost:8000/api/health/providers
+
+# Agents list (16 agent definitions)
+curl http://localhost:8000/agents
+
+# Mission start (POST)
+curl -X POST http://localhost:8000/api/mission/start \
+  -H "Content-Type: application/json" \
+  -d '{"entity": "Test Entity"}'
+
+# Frontend builds
+cd frontend && npm run build
+
+# Backend imports cleanly
+cd backend && python -c "import main; print('OK')"
+
+# Full end-to-end smoke test (file → mission → report)
+python scripts/smoke_test.py
+```
+
+`scripts/smoke_test.py` exercises the entire pipeline: health check → file upload → mission start → JSON wiki-nodes parse → persistence check. Writes a fixture file to `uploads/acme-corp-smoke.txt`. Requires backend running on :8000.
+
+---
+
+## Status: Phase 0 — end-to-end pipeline running
+
+What's done:
+- ✅ File ingestion (PDF / DOCX / XLSX / TXT / images via vision)
+- ✅ Wiki-formatted markdown output (Entity / Source / Confidence / Chunk ID)
+- ✅ SQLite + Qdrant dual-store vectorization
+- ✅ 6-tool agent surface (ingest / search / query_memory / evaluate / delegate / synthesize)
+- ✅ Mission loop: planner → scout → librarian → critic → synthesizer
+- ✅ React Flow canvas with EntityNode / WikiNode / SourceNode
+- ✅ FileDropZone wired to `/api/upload`
+- ✅ Mission trigger wired to `/api/mission/start`
+- ✅ Radiating wiki-node layout from synth report JSON
+- ✅ Multi-provider LLM routing with cost discipline
+- ✅ Review harness (3-persona validation) + auto-commit hook
+
+Known gaps (Phase 0.1):
+- ⚠️ Tags section in wiki spec is structural-only (parser doesn't auto-tag yet)
+- ⚠️ Synth report renders as plain text in side panel — no real markdown renderer yet
+- ⚠️ Old `.sami-history/` / `.sami-kanban.json` / `sami.db` paths were renamed to `.tangle-*` / `tangle.db` in code, but no migration for any pre-existing data files (none expected — fresh project)
+- ⚠️ No live end-to-end test committed yet
+
+---
+
+## Working style with this user
+
+- They're the brand owner. Follow naming preferences strictly.
+- "Peu un peu." Don't over-scope. If a feature doesn't fit Phase 0, log it for later.
+- "Kostnad är en feature." Use the cheapest model that returns valid output.
+- Reports, not walls of text. When summarizing, lead with the conclusion.
+- They're Swedish-English bilingual. Match their register — casual, technical, no fluff.
