@@ -32,7 +32,7 @@ sync_targets:
 - [ ] **Real markdown rendering in report panel** — current side-panel just shows `whiteSpace: 'pre-wrap'`. Add `react-markdown` + `remark-gfm` for proper headers/lists/code blocks.
 - [ ] **Auto-tagging in wiki spec** — current `#untagged` placeholder. Use cheap LLM call to generate `#health #finance #legal #contact #risk` based on content.
 - [ ] **Retry logic on orchestrator failures** — if `evaluate` gate fails, current code does one retry. Make it N retries with backoff (1s, 2s, 4s).
-- [ ] **Replace DuckDuckGo with Jina AI or SerpAPI** — current HTML scrape is fragile + fallback hallucinates. Jina (r.jina.ai) is free + no key. SerpAPI has 100 free calls/day.
+- [x] **Replace DuckDuckGo with Jina AI** — done (2026-06-28). `search()` in agent_orchestrator.py now uses Jina AI Reader (`s.jina.ai`) as primary search. Free tier (20 req/min without API key, 500 req/min with `JINA_API_KEY`). Returns clean Markdown instead of scraped HTML snippets. Fallback LLM search no longer hallucinates — now honestly reports "Web search unavailable" when uncertain.
 - [ ] **Image Analyst agent role** — wire `AGENT_DEFS["image_analyst"]` so image-only missions are first-class.
 - [ ] **WebSocket localStorage persistence** — telemetry events lost on page refresh. Persist to localStorage and replay on reconnect, or rehydrate from SQLite.
 - [x] **`.env.example`** — done (sub-agent created `/Users/perbrinell/Documents/DROPHELP/.env.example`)

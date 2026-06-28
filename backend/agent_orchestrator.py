@@ -17,6 +17,27 @@ from wiki_vault import WikiVault, export_on_mission_enabled
 
 logger = logging.getLogger("tangle.orchestrator")
 
+# ── Scout source selection ────────────────────────────────────
+# jina       → Jina AI search only (default, no local resources)
+# exa        → Exa AI-native search (20k free req/month)
+# crawl4ai   → Jina search for URLs → Crawl4AI deep-crawls top 2-3
+# exa-crawl  → Exa search for URLs → Crawl4AI deep-crawls top 2-3
+# both       → Jina search + Crawl4AI crawl combined
+SCOUT_SOURCE = os.getenv("TANGLE_SCOUT_SOURCE", "jina").strip().lower()
+EXA_API_KEY = os.getenv("EXA_API_KEY", "")
+
+CRAWL4AI_AVAILABLE = False
+try:
+    from crawl4ai import AsyncWebCrawler
+    CRAWL4AI_AVAILABLE = True
+except ImportError:
+    if SCOUT_SOURCE in ("crawl4ai", "both", "exa-crawl"):
+        logger.warning(
+            f"TANGLE_SCOUT_SOURCE={SCOUT_SOURCE} but crawl4ai not installed. "
+            f"Falling back to jina. Install: pip install crawl4ai"
+        )
+        SCOUT_SOURCE = "jina"
+
 AGENT_DEFS = {
     "planner": {
         "name": "Planner",
@@ -84,37 +105,243 @@ class AgentOrchestrator:
             self._emit({"type": "tool_result", "agent_id": "orchestrator", "tool": "ingest", "result": err})
             return {"error": err}
 
-    async def search(self, query: str, agent_id: str = "scout") -> str:
-        """Tool 2: Search the web via DuckDuckGo HTML parsing or fallback to LLM knowledge if throttled."""
-        self._emit({"type": "tool_call", "agent_id": agent_id, "tool": "search", "args": {"query": query}})
-        
-        # DuckDuckGo HTML Scraper fallback (API key free)
-        headers = {"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}
-        try:
-            async with httpx.AsyncClient(headers=headers, timeout=10) as client:
-                resp = await client.get(f"https://html.duckduckgo.com/html/?q={httpx.URLEscaper().quote(query)}")
-                if resp.status_code == 200:
-                    from bs4 import BeautifulSoup
-                    soup = BeautifulSoup(resp.text, "html.parser")
-                    links = soup.find_all("a", class_="result__snippet")
-                    snippets = [l.get_text().strip() for l in links[:5]]
-                    if snippets:
-                        res = "\n- ".join(snippets)
-                        self._emit({"type": "tool_result", "agent_id": agent_id, "tool": "search", "result": res[:300] + "..."})
-                        return f"Web Search results for '{query}':\n- " + res
-        except Exception as e:
-            logger.warning(f"DuckDuckGo search failed: {e}. Falling back to internal LLM search.")
+    async def _crawl_urls(self, urls: List[str], agent_id: str, timeout_per_url: int = 20) -> str:
+        """Deep-crawl a list of URLs with Crawl4AI. Returns combined Markdown.
 
-        # Fallback Search via OpenRouter
+        Each URL is crawled with a browser instance — heavy operation.
+        Limit to 2-3 URLs per call to keep mission latency reasonable.
+        """
+        if not CRAWL4AI_AVAILABLE:
+            return ""
+        crawled: List[str] = []
+        try:
+            async with AsyncWebCrawler() as crawler:
+                for i, url in enumerate(urls[:3]):
+                    try:
+                        self._emit({
+                            "type": "tool_call",
+                            "agent_id": agent_id,
+                            "tool": "crawl4ai",
+                            "args": {"url": url, "idx": i + 1},
+                        })
+                        result = await asyncio.wait_for(
+                            crawler.arun(url=url, bypass_cache=True),
+                            timeout=timeout_per_url,
+                        )
+                        md = (result.markdown or "").strip()
+                        if md and len(md) > 50:
+                            page = md[:1500]
+                            if len(md) > 1500:
+                                page += f"\n\n…truncated ({len(md) - 1500} more chars)"
+                            crawled.append(f"## Crawled: {url}\n\n{page}")
+                            self._emit({
+                                "type": "tool_result",
+                                "agent_id": agent_id,
+                                "tool": "crawl4ai",
+                                "result": f"{url}: {len(md)} chars Markdown",
+                            })
+                        else:
+                            self._emit({
+                                "type": "tool_result",
+                                "agent_id": agent_id,
+                                "tool": "crawl4ai",
+                                "result": f"{url}: empty/invalid response",
+                            })
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Crawl4AI timeout for {url}")
+                    except Exception as e:
+                        logger.warning(f"Crawl4AI failed for {url}: {e}")
+        except Exception as e:
+            logger.warning(f"Crawl4AI crawler init failed: {e}")
+        return "\n\n".join(crawled) if crawled else ""
+
+    @staticmethod
+    def _extract_urls_from_markdown(md: str) -> List[str]:
+        """Pull http/https URLs from search response Markdown.
+
+        Used for Jina search results which embed links as inline URLs.
+        Exa returns structured JSON so doesn't need regex extraction.
+        """
+        found = re.findall(r'https?://[^\s)>"\x27]+', md)
+        seen: set = set()
+        unique: List[str] = []
+        for u in found:
+            u = u.rstrip(".!?,;:")
+            if u not in seen:
+                seen.add(u)
+                unique.append(u)
+        return unique
+
+    async def _search_exa(self, query: str, agent_id: str, num_results: int = 5) -> tuple[str, List[str]]:
+        """Search via Exa API (AI-native search, 20k free req/month).
+
+        Returns (formatted_markdown, extracted_urls).
+        Exa returns structured JSON with title, url, text, score per result.
+        """
+        if not EXA_API_KEY:
+            logger.warning("Exa search requested but EXA_API_KEY not set")
+            return "", []
+        try:
+            self._emit({
+                "type": "tool_call",
+                "agent_id": agent_id,
+                "tool": "exa_search",
+                "args": {"query": query, "num_results": num_results},
+            })
+            async with httpx.AsyncClient(timeout=20) as client:
+                resp = await client.post(
+                    "https://api.exa.ai/search",
+                    headers={
+                        "x-api-key": EXA_API_KEY,
+                        "Content-Type": "application/json",
+                    },
+                    json={"query": query, "type": "auto", "numResults": num_results},
+                )
+                if resp.status_code != 200:
+                    logger.warning(f"Exa API returned {resp.status_code}: {resp.text[:200]}")
+                    return "", []
+                data = resp.json()
+                results = data.get("results", [])
+                if not results:
+                    return "", []
+
+                # Assemble Markdown from structured results
+                parts: List[str] = []
+                urls: List[str] = []
+                for i, r in enumerate(results):
+                    title = r.get("title", "Untitled")
+                    url = r.get("url", "")
+                    text = (r.get("text") or "").strip()
+                    score = r.get("score", 0)
+                    published = r.get("publishedDate", "")
+                    if url:
+                        urls.append(url)
+                    header = f"## [{i+1}] {title}"
+                    meta_parts = []
+                    if published:
+                        meta_parts.append(published)
+                    if score:
+                        meta_parts.append(f"score: {score:.2f}")
+                    meta = f"{url} ({', '.join(meta_parts)})" if meta_parts else url
+                    # Cap text per result at 600 chars (5 results × 600 ≈ 3000 total)
+                    body = text[:600] if text else "[no content]"
+                    if text and len(text) > 600:
+                        body += f"\n…truncated ({len(text) - 600} more chars)"
+                    parts.append(f"{header}\n{meta}\n\n{body}")
+
+                content = "\n\n".join(parts)
+                self._emit({
+                    "type": "tool_result",
+                    "agent_id": agent_id,
+                    "tool": "exa_search",
+                    "result": f"Exa: {len(results)} results, {len(urls)} URLs",
+                })
+                return content, urls
+        except Exception as e:
+            logger.warning(f"Exa search failed: {e}")
+            return "", []
+
+    async def _search_jina(self, query: str, agent_id: str) -> tuple[str, List[str]]:
+        """Search via Jina AI (s.jina.ai). Returns (formatted_markdown, extracted_urls).
+
+        Free for basic usage — 20 req/min without API key, 500 with.
+        """
+        jina_token = os.getenv("JINA_API_KEY", "")
+        jina_headers: Dict[str, str] = {
+            "Accept": "text/plain",
+            "User-Agent": "TANGLE/2.0",
+        }
+        if jina_token:
+            jina_headers["Authorization"] = f"Bearer {jina_token}"
+        try:
+            async with httpx.AsyncClient(timeout=15) as client:
+                resp = await client.get(
+                    f"https://s.jina.ai/?q={httpx.URLEscaper().quote(query)}",
+                    headers=jina_headers,
+                )
+                if resp.status_code == 200:
+                    content = resp.text.strip()
+                    if content and len(content) > 20:
+                        urls = self._extract_urls_from_markdown(content)
+                        self._emit({
+                            "type": "tool_result",
+                            "agent_id": agent_id,
+                            "tool": "jina_search",
+                            "result": f"Jina: {len(content)} chars, {len(urls)} URLs",
+                        })
+                        return content, urls
+        except Exception as e:
+            logger.warning(f"Jina AI search failed: {e}")
+        return "", []
+
+    async def search(self, query: str, agent_id: str = "scout") -> str:
+        """Tool 2: Web search via Jina, Exa, or Crawl4AI depending on SCOUT_SOURCE.
+
+        Sources (TANGLE_SCOUT_SOURCE env var):
+          jina       → Jina AI search (default, free, no key needed)
+          exa        → Exa AI-native search (20k free req/month, needs EXA_API_KEY)
+          crawl4ai   → Jina + Crawl4AI deep-crawl
+          exa-crawl  → Exa + Crawl4AI deep-crawl
+          both       → Jina + Crawl4AI deep-crawl
+
+        Falls back to OpenRouter LLM search if all search providers are unreachable.
+        """
+        self._emit({"type": "tool_call", "agent_id": agent_id, "tool": "search", "args": {"query": query}})
+        use_crawl = SCOUT_SOURCE in ("crawl4ai", "both", "exa-crawl") and CRAWL4AI_AVAILABLE
+        use_exa = SCOUT_SOURCE in ("exa", "exa-crawl") and bool(EXA_API_KEY)
+        if SCOUT_SOURCE in ("exa", "exa-crawl") and not EXA_API_KEY:
+            logger.warning(
+                f"TANGLE_SCOUT_SOURCE={SCOUT_SOURCE} but EXA_API_KEY not set. "
+                f"Falling back to jina."
+            )
+
+        # ── 1. Primary Search ───────────────────────────────
+        if use_exa:
+            primary_content, urls = await self._search_exa(query, agent_id)
+            source_label = "Exa"
+        else:
+            primary_content, urls = await self._search_jina(query, agent_id)
+            source_label = "Jina AI"
+
+        # ── 2. Deep Crawl (shared logic) ────────────────────
+        crawl_content = ""
+        if use_crawl and primary_content and urls:
+            logger.info(f"Crawl4AI mode: deep-crawling top {min(3, len(urls))} URLs from {source_label} results")
+            crawl_content = await self._crawl_urls(urls, agent_id)
+
+        # ── 3. Assemble result (shared logic) ───────────────
+        if primary_content:
+            total_chars = len(primary_content) + len(crawl_content)
+            label = f"{source_label} + Crawl4AI" if crawl_content else source_label
+
+            if crawl_content:
+                primary_portion = primary_content[:2000]
+                if len(primary_content) > 2000:
+                    primary_portion += f"\n\n…truncated ({len(primary_content) - 2000} more chars in search results)"
+                body = f"Search results for '{query}':\n\n{primary_portion}\n\n─── Deep-crawled pages ───\n\n{crawl_content}"
+            else:
+                primary_portion = primary_content[:3000]
+                if len(primary_content) > 3000:
+                    primary_portion += f"\n\n…truncated ({len(primary_content) - 3000} more chars)"
+                body = primary_portion
+
+            self._emit({"type": "tool_result", "agent_id": agent_id, "tool": "search", "result": f"{label}: {total_chars} chars"})
+            return f"{label} Search results for '{query}':\n\n{body}"
+
+        # ── Fallback: LLM search via OpenRouter ──────────────
         try:
             messages = [
-                {"role": "system", "content": "You are a web search helper. Simulate a search and return factual background information on the query."},
-                {"role": "user", "content": f"Search query: {query}"}
+                {"role": "system", "content": (
+                    "You are a web search helper. If you genuinely know facts about the query "
+                    "from your training data, share them concisely. If you are uncertain, say "
+                    "'Web search unavailable — no real-time data.' Do NOT fabricate information."
+                )},
+                {"role": "user", "content": f"Search query: {query}"},
             ]
             resp = await self.gateway.chat(self.default_model, messages, agent_context=self._ctx())
             res = resp.get("content", "No information found.")
             self._emit({"type": "tool_result", "agent_id": agent_id, "tool": "search", "result": res[:300] + "..."})
-            return f"Mock Web Search results for '{query}':\n{res}"
+            return f"LLM Knowledge (web search unavailable) for '{query}':\n{res}"
         except Exception as e:
             return f"Search service temporarily offline: {e}"
 
