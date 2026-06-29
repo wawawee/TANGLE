@@ -8,10 +8,8 @@
 
 ## Related Entities
 
-- [[api-smoke-fix-verify/INDEX|API Smoke Fix Verify]] — 1 shared chunk(s)
-- [[cron-verify-smoke-entity/INDEX|Cron Verify Smoke Entity]] — 1 shared chunk(s)
+- [[acme-corp/INDEX|Acme Corp]] — 1 shared chunk(s)
 - [[luna-the-cat/INDEX|Luna the Cat]] — 1 shared chunk(s)
-- [[smoke-test-entity/INDEX|Smoke Test Entity]] — 1 shared chunk(s)
 
 ---
 

@@ -1,6 +1,6 @@
 # Luna the Cat
 
-> Wiki index for entity **Luna the Cat** — 6 chunk(s).
+> Wiki index for entity **Luna the Cat** — 7 chunk(s).
 
 ## Chunks
 
@@ -10,14 +10,19 @@
 - [[luna-the-cat/6cfe4c9d-188|2026-06-28 · tangle-synthesis-luna-the-cat.md · conf 0.50]]
 - [[luna-the-cat/145a571d-dfd|2026-06-28 · luna-cat-profile.md · conf 0.90]]
 - [[luna-the-cat/3273674c-2d0|2026-06-28 · tangle-synthesis-luna-the-cat.md · conf 0.50]]
+- [[luna-the-cat/031b1ff5-585|2026-06-28 · tangle-synthesis-luna-the-cat.md · conf 0.50]]
 
 ## Related Entities
 
-- [[smoke-test-entity/INDEX|Smoke Test Entity]] — 2 shared chunk(s)
+- [[acme-corp/INDEX|Acme Corp]] — 3 shared chunk(s)
+- [[evalgate-test-co/INDEX|EvalGate Test Co]] — 2 shared chunk(s)
 - [[smoketest-endpoint-fields/INDEX|__smoketest_endpoint_fields__]] — 1 shared chunk(s)
-- [[api-smoke-fix-verify/INDEX|API Smoke Fix Verify]] — 1 shared chunk(s)
-- [[cron-verify-smoke-entity/INDEX|Cron Verify Smoke Entity]] — 1 shared chunk(s)
-- [[tagged-entity-test/INDEX|Tagged Entity Test]] — 1 shared chunk(s)
+- [[acme-corp/INDEX|ACME Corp]] — 1 shared chunk(s)
+- [[skatterevision/INDEX|SkatteRevision]] — 1 shared chunk(s)
+- [[skatterevision-system/INDEX|SkatteRevision System]] — 1 shared chunk(s)
+- [[skatterevision-system/INDEX|SkatteRevision system]] — 1 shared chunk(s)
+- [[smoke-test-acme-2/INDEX|Smoke Test Acme 2]] — 1 shared chunk(s)
+- [[test-corp/INDEX|Test Corp]] — 1 shared chunk(s)
 
 ---
 
