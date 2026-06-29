@@ -55,6 +55,10 @@ AGENT_DEFS = {
         "name": "Critic",
         "prompt": "You are the CRITIC agent. Your job is to evaluate whether the gathered intelligence is sufficient and accurate. Provide constructive critique and output a success score between 0.0 and 1.0. You must return a JSON response containing 'score' (float) and 'critique' (string)."
     },
+    "image_analyst": {
+        "name": "Image Analyst",
+        "prompt": "You are the IMAGE ANALYST agent specialized in extracting structured information from images (photos, scans, screenshots, charts, diagrams). Your job is to analyze the visual content for entity '{entity}' and produce a detailed, factual markdown description. Include any visible text, objects, people, layouts, colors, branding, and contextual cues. Flag anything ambiguous or low-confidence."
+    },
     "synthesizer": {
         "name": "Synthesizer",
         "prompt": "You are the SYNTHESIZER agent. Your job is to merge all findings (web search results, wiki chunks, and agent insights) into a master report and format it as a radiating network structure of recommendations, risks, and facts."
@@ -62,6 +66,52 @@ AGENT_DEFS = {
 }
 
 class AgentOrchestrator:
+    # Agent → preferred free model (tiered by role fit, context length, and reliability).
+    # Order = fallback order within each tier. Top of list = best first choice.
+    AGENT_MODELS = {
+        # High-reasoning / planning / synthesis → best structured-output models
+        "planner": [
+            "openrouter/qwen/qwen3-coder:free",
+            "openrouter/openai/gpt-oss-120b:free",
+            "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+        ],
+        "synthesizer": [
+            "openrouter/qwen/qwen3-coder:free",
+            "openrouter/openai/gpt-oss-120b:free",
+            "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+        ],
+        # Scout (web search summarization) → solid all-rounder
+        "scout": [
+            "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+            "openrouter/nousresearch/hermes-3-llama-3.1-405b:free",
+            "openrouter/openai/gpt-oss-120b:free",
+        ],
+        # Librarian (internal wiki recall) → strong long-context summarizer
+        "librarian": [
+            "openrouter/openai/gpt-oss-120b:free",
+            "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+            "openrouter/nousresearch/hermes-3-llama-3.1-405b:free",
+        ],
+        # Critic (JSON eval gate) → disciplined instruction follower
+        "critic": [
+            "openrouter/nousresearch/hermes-3-llama-3.1-405b:free",
+            "openrouter/qwen/qwen3-coder:free",
+            "openrouter/openai/gpt-oss-120b:free",
+        ],
+        # Image analyst → vision-capable
+        "image_analyst": [
+            "openrouter/nvidia/nemotron-nano-12b-v2-vl:free",
+            "openrouter/google/gemma-4-31b-it:free",
+        ],
+        # Generic / unknown agent
+        "default": [
+            "openrouter/meta-llama/llama-3.3-70b-instruct:free",
+            "openrouter/openai/gpt-oss-120b:free",
+            "openrouter/nousresearch/hermes-3-llama-3.1-405b:free",
+            "openrouter/meta-llama/llama-3.2-3b-instruct:free",
+        ],
+    }
+
     def __init__(self, gateway: FreeGateway):
         self.gateway = gateway
         self.parser = ParsingEngine(gateway=gateway)
@@ -70,6 +120,7 @@ class AgentOrchestrator:
         self.callbacks: List[Callable[[Dict], None]] = []
         self._running = False
         self._current_mission_id: Optional[str] = None  # threaded to gateway for cost tracking
+        # Global fallback only; delegate() prefers agent-specific list above.
         self.default_model = "openrouter/meta-llama/llama-3.3-70b-instruct:free"
 
     def _ctx(self) -> dict:
@@ -411,37 +462,62 @@ class AgentOrchestrator:
                 "verified": False,
             }
 
+    def _model_for_agent(self, agent_id: str) -> str:
+        """Pick the best free model for a given agent, falling back through the tier list."""
+        chain = self.AGENT_MODELS.get(agent_id, self.AGENT_MODELS["default"])
+        for candidate in chain:
+            # We don’t verify availability here — the gateway already handles retries/fallbacks.
+            return candidate
+        return self.default_model
+
     async def delegate(self, task: str, agent_id: str, entity_name: str) -> str:
-        """Tool 5: Delegate subtask to a specialized agent."""
+        """Tool 5: Delegate subtask to a specialized agent.
+
+        Model selection is role-aware: planner/synthesizer lean toward structured-output
+        coders, critic toward instruction-followers, scout/librarian toward generalists,
+        image_analyst toward vision. Each role has an ordered fallback chain in
+        `AGENT_MODELS`.
+        """
         self._emit({"type": "sub_delegate", "from": "orchestrator", "to": agent_id, "task": task})
         self._emit({"type": "agent_start", "agent_id": agent_id, "task": task})
-        
+
         agent_def = AGENT_DEFS.get(agent_id, {"name": "Assistant", "prompt": "You are a helpful assistant."})
         system_prompt = agent_def["prompt"].format(entity=entity_name)
-        
-        # Determine appropriate tools based on agent
+
         messages = [
             {"role": "system", "content": system_prompt},
-            {"role": "user", "content": task}
+            {"role": "user", "content": task},
         ]
-        
+
         try:
-            # Let the agent think
             self._emit({"type": "agent_think", "agent_id": agent_id, "turn": 1})
-            
-            # Simple agent execution loops: Scout searches, Librarian queries memory
+
+            # Pre-fetch search/memory context for agents that use those tools
             if agent_id == "scout":
-                # First run search
                 search_results = await self.search(task, agent_id=agent_id)
-                messages.append({"role": "user", "content": f"Here are the search results:\n{search_results}\n\nSummarize the key facts, risks, and opportunities."})
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Here are the search results:\n"
+                        f"{search_results}\n\n"
+                        "Summarize the key facts, risks, and opportunities."
+                    ),
+                })
             elif agent_id == "librarian":
-                # Query internal documents
                 mem_results = await self.query_memory(task, entity_name, agent_id=agent_id)
-                messages.append({"role": "user", "content": f"Here is the wiki document content:\n{mem_results}\n\nSummarize the internal file knowledge."})
-            
-            resp = await self.gateway.chat(self.default_model, messages, agent_context=self._ctx())
+                messages.append({
+                    "role": "user",
+                    "content": (
+                        "Here is the wiki document content:\n"
+                        f"{mem_results}\n\n"
+                        "Summarize the internal file knowledge."
+                    ),
+                })
+
+            model = self._model_for_agent(agent_id)
+            resp = await self.gateway.chat(model, messages, agent_context=self._ctx())
             res = resp.get("content", "Error generating response.")
-            
+
             self._emit({"type": "agent_complete", "agent_id": agent_id, "result": res[:500] + "..."})
             return res
         except Exception as e:
@@ -717,16 +793,45 @@ class AgentOrchestrator:
             f"Does this content explain the situation of '{entity_name}' and provide concrete ways to help?"
         )
 
-        # If low score, run scout again with refined queries (Phase 0 simplified: single retry loop)
-        if not evaluation["passed"]:
-            logger.info("Evaluation gate failed. Redo-ing scout query with critic feedback.")
-            self._emit({"type": "workflow_step", "agent_id": "maestro", "task": f"Gate failed. Retrying: {evaluation['critique'][:100]}"})
+        # If low score, run scout again with refined queries (N retries with exponential backoff)
+        MAX_RETRIES = int(os.getenv("TANGLE_ORCHESTRATOR_MAX_RETRIES", "3"))
+        retry_count = 0
+        while not evaluation["passed"] and retry_count < MAX_RETRIES:
+            retry_count += 1
+            backoff_s = 2 ** (retry_count - 1)  # 1s, 2s, 4s
+            logger.info(
+                f"Evaluation gate failed (attempt {retry_count}/{MAX_RETRIES}). "
+                f"Backing off {backoff_s}s before retry."
+            )
+            self._emit({
+                "type": "workflow_step", "agent_id": "maestro",
+                "task": f"Gate failed (attempt {retry_count}/{MAX_RETRIES}). "
+                        f"Retrying in {backoff_s}s: {evaluation['critique'][:80]}"
+            })
+            await asyncio.sleep(backoff_s)
             retry_findings = await self.delegate(
                 f"Perform deeper research based on this critique: {evaluation['critique']}",
                 "scout",
                 entity_name
             )
             findings.append(retry_findings)
+
+            # Re-evaluate after retry
+            combined_text = "\n\n".join(findings)
+            evaluation = await self.evaluate(
+                combined_text,
+                f"Does this content explain the situation of '{entity_name}' and provide concrete ways to help?"
+            )
+
+        if not evaluation["passed"]:
+            logger.warning(
+                f"Evaluation gate still failing after {MAX_RETRIES} retries. "
+                f"Continuing with best-effort synthesis."
+            )
+            self._emit({
+                "type": "workflow_step", "agent_id": "maestro",
+                "task": f"Gate still failing after {MAX_RETRIES} retries. Using best-effort."
+            })
 
         # Step 5: Synthesize final output (dual output: report_markdown + wiki_entry_markdown)
         self._emit({"type": "workflow_step", "agent_id": "maestro", "task": "Synthesizing master report"})

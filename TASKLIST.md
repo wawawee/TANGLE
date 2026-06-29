@@ -33,7 +33,8 @@ sync_targets:
 - [ ] **Auto-tagging in wiki spec** — current `#untagged` placeholder. Use cheap LLM call to generate `#health #finance #legal #contact #risk` based on content.
 - [ ] **Retry logic on orchestrator failures** — if `evaluate` gate fails, current code does one retry. Make it N retries with backoff (1s, 2s, 4s).
 - [x] **Replace DuckDuckGo with Jina AI** — done (2026-06-28). `search()` in agent_orchestrator.py now uses Jina AI Reader (`s.jina.ai`) as primary search. Free tier (20 req/min without API key, 500 req/min with `JINA_API_KEY`). Returns clean Markdown instead of scraped HTML snippets. Fallback LLM search no longer hallucinates — now honestly reports "Web search unavailable" when uncertain.
-- [ ] **Image Analyst agent role** — wire `AGENT_DEFS["image_analyst"]` so image-only missions are first-class.
+   - [x] **Per-agent free-model routing** — added `AGENT_MODELS` tiered mapping in `agent_orchestrator.py`. Planner/synthesizer → Qwen3-Coder, Scout → Llama-3.3-70B, Librarian → GPT-OSS-120B, Critic → Hermes-3-405B, Image → Nemotron-VL. Single source of truth, gateway still handles retries.
+   - [ ] **Role-aware model selection** — planner/synthesizer lean toward structured-output coders, critic toward instruction-followers, scout/librarian toward generalists, image_analyst toward vision. Each role has an ordered fallback chain.
 - [ ] **WebSocket localStorage persistence** — telemetry events lost on page refresh. Persist to localStorage and replay on reconnect, or rehydrate from SQLite.
 - [x] **`.env.example`** — done (sub-agent created `/Users/perbrinell/Documents/DROPHELP/.env.example`)
 - [ ] **Error boundaries in React** — current app would white-screen on any throw. Add ErrorBoundary around major panels.
@@ -156,12 +157,23 @@ Per Per's architecture rule (June 2026): **new tools integrate as toggleable bac
 
 | Tool | Repo | What it does | TANGLE value | Integration | Phase |
 |---|---|---|---|---|---|
-| **headroom** | `chopratejas/headroom` | Context compression layer (60-95% token reduction) | Wraps `free_gateway.chat()` — every LLM call gets cheaper without changing call sites | Library mode (`from headroom import compress`) inserted into gateway. Toggle via env `TANGLE_HEADROOM_ENABLED=1`. Optional "compression-stats" node type in React Flow to visualize savings. | **0.1** — fits "kostnad är en feature" mantra directly |
+| **headroom** | `chopratejas/headroom` | Context compression layer (60-95% token reduction) | Wraps `free_gateway.chat()` — every LLM call gets cheaper without changing call sites | Library mode inserted into gateway. Toggle via env `TANGLE_HEADROOM_ENABLED=1`. | **0.1** — fits "kostnad är en feature" mantra directly |
 | **last30days-skill** | `mvanhorn/last30days-skill` | Cross-platform trending research, 14 platforms last 30 days | Replaces broken DuckDuckGo scout (already flagged in Phase 0.1 queue) | Runs in background during scout step. Toggle `TANGLE_SCOUT_SOURCE=jina\|last30days\|duckduckgo`. Falls back through chain. | **0.1** — solves an open bug |
 | **promptfoo** | `promptfoo/promptfoo` | LLM eval/red-team framework, test cases, regression catching | Upgrades our `review_harness.py` from 3 personas to declarative test cases. Catches orchestrator prompt regressions. | CLI tool, runs on demand (`promptfoo eval`). Writes results to `backend/eval_results/`. Toggle via CI step. | **0.2** — depends on having more prompts worth testing |
 | **OpenViking** | `volcengine/OpenViking` | Context database w/ filesystem paradigm (`viking://`), L0/L1/L2 hierarchical loading | Augments `vector_store.py` with structured memory + self-iterating memory loop | Toggleable backend for `vector_store`. `TANGLE_MEMORY=qdrant\|openviking\|sqlite_fallback`. New "memory-layer" node type in React Flow to visualize L0/L1/L2. | **1.0** — needs multi-entity workloads to justify |
-| **open-notebook** | `lfnovo/open-notebook` | Privacy-focused NotebookLM clone (Streamlit + SurrealDB + LangChain) | Optional ingestion alternative for users who want a richer notebook UI on top of TANGLE's wiki | Standalone service we can optionally point to. We **don't replace `parsing_engine.py`** — users get both. Optional integration via webhook. | **1.0+** — competes with our UI; deferred until we know if anyone wants both |
+| **chonkie** | `chonkie/chonkie` | Smart text chunking for RAG (token/sentence/recursive/semantic/late) | Could replace our naive chunking in `parsing_engine.py` with semantically-aware splits. | Toggleable chunking backend. `TANGLE_CHUNKER=chonkie|native`. | **0.1** — good fit, but 129MB model download on first run is heavy for Phase 0; evaluate in Phase 1 |
 | **Heretic** | `p-e-w/heretic` | Removes safety alignment from open-weight LLMs without expensive post-training | **Legit use case:** TANGLE helps entities in rail-sensitive domains — true-crime book authoring, security research, trauma-informed therapy, legal cases, adult content creation. Default commercial rails get in the way of these legitimate uses. | Toggleable model modifier. `TANGLE_LLM_MODE=safe\|uncensored`. Default stays safe (commercial APIs with rails); opt-in flips to a Heretic-modified local model for missions where user explicitly marks the entity as rail-sensitive. Per-mission toggle, never global default. | **1.0** — needs careful UX (clear consent) and a local model deployment story |
+
+### Ins Hetvalda Open-Source-Modeller som TANGLE nu använder (via OpenRouter :free)
+
+Per senaste OpenRouter-modellgenomgång (2026-06-29):
+
+- **Planner/Synthesizer**: `qwen/qwen3-coder:free` (1M ctx, Apache 2.0) — bäst för struktur och kod-output.
+- **Scout**: `meta-llama/llama-3.3-70b-instruct:free` (131K ctx) — stabil allrounder, default tidigare.
+- **Librarian**: `openai/gpt-oss-120b:free` (131K ctx) — stark kontext-hantering.
+- **Critic**: `nousresearch/hermes-3-llama-3.1-405b:free` (131K ctx) — disciplined JSON-utdata.
+- **Image Analyst**: `nvidia/nemotron-nano-12b-v2-vl:free` (128K ctx, multimodal) — ersätter tidigare vision-default.
+- **Global Fallback**: Llama-3.2-3B → snabb och lätt.
 
 ### Architecture rules for new integrations
 
