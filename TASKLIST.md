@@ -5,7 +5,7 @@
 # Status icons: 🚧 in progress · 📋 queued · ✅ done · 💡 idea · ⚠️ blocker · 🧠 human note
 project: tangle
 version: 1.0.0
-last_updated: 2026-06-27
+last_updated: 2026-06-29
 sync_targets:
   - mavis_plans
   - human_review
@@ -23,7 +23,6 @@ sync_targets:
 ## 🚧 IN PROGRESS
 
 - [ ] **Phase 0 live verification** — user runs `python scripts/smoke_test.py` against a fresh venv; report any failures back here · owner: human · started: 2026-06-27
-- [ ] **Commit current state** — ~55 changed files (archive + rename + version bumps + new docs + smoke test) ready for one or two atomic commits · owner: mavis · blocked-on: user go-ahead
 
 ---
 
@@ -128,10 +127,18 @@ Examples:
 - [date] Note: user prefers warm brown UI not neon — applies to landing pages too
 -->
 
+- [2026-06-29] **Cross-project vault leak lesson.** When TANGLE ingests source files from another project (e.g. SKATTEREVISION-REBOOT docs), the generated wiki entries do NOT belong in DROPHELP's vault — they belong in that project's vault. The 2026-06-29 R3 incident shows that even with `.tangle/vault/` gitignored, accidental ingestion still pollutes this DB+vector store. Future fix: route mission output by `source_file_root` — if a mission's uploads come from outside DROPHELP, the wiki_entry goes to whichever project's vault the source root lives in. Until that lands, **no TANGLE mission should ingest files from `/Users/perbrinell/a0/usr/projects/<other_project>/`** without explicit per-mission opt-in.
+- [2026-06-29] README + AGENTS.md still reference the old `docs/wiki/` path. Update in same PR if wiki path migration gets touched again.
+- [2026-06-29] Obsidian compatibility: previously the vault lived at `docs/wiki/`; Per may have Obsidian pointing there. If he wants live-sync after this migration, either symlink `.tangle/vault/` to the Obsidian vault path or set `TANGLE_VAULT_ROOT` to the Obsidian-include path.
+
 ---
 
 ## ✅ RECENTLY DONE
 
+- ✅ **Wiki vault → `.tangle/vault/` migration** — 2026-06-29. Vault export was writing to `docs/wiki/` inside the repo, which created a cross-project data-leak path (R3 / SKATTEREVISION-REBOOT entity got committed in 7e40755 before anyone noticed). New default lives outside git (`TANGLE_VAULT_ROOT` env override supported for Obsidian live-sync). Committed: `a168847`.
+- ✅ **R3 leak incident handled** — 2026-06-29. Three SKATTEREVISION-REBOOT entities (brev-till-skatteverket..., skatterevision, skatterevision-system) caught in commit `7e40755`, reverted in `1ee1ce7`, files moved to `SKATTEREVISION-REBOOT/_inbox_from_tangle_2026-06-29/wiki-entities/` for Per to triage. Branch never pushed — leak averted. Lesson: any time TANGLE ingests from another project, the wiki output belongs in THAT project's vault, not DROPHELP's. See Human Notes below.
+- ✅ **`.gitignore` reset** — 2026-06-29. Six untracked legacy dirs (`.archon/`, `.claude/`, `.review-harness/`, `twisted-stacks-agentic-team/`, `uploads/`, `.sami-agent-prompt.md`) now properly excluded. Committed: `c2f17fa`.
+- ✅ **Phase 0.1 batch commits** — 2026-06-29. Three commits staged: `a329d11` vault cleanup of stale smoke-test entities, `1ee1ce7` DEEP_EVALUATION + Phase 0.1 fixtures, `a168847` wiki vault path migration. Branch is 4 commits ahead of origin/master (not pushed).
 - ✅ Project renamed: sami/Aegis/ANLAGSTAVLAN → **TANGLE** (29 places: loggers, paths, UI, docstrings)
 - ✅ All deps upgraded to latest (frontend 14 packages, backend 16 packages)
 - ✅ Frontend build: tsc 6.0.3 + vite 8.1.0 + react 19.2.7 → 437 KB JS, 0 vulns
