@@ -4,6 +4,7 @@ import os
 import re
 import json
 import uuid
+import time
 import asyncio
 import logging
 from datetime import datetime, timezone
@@ -14,6 +15,11 @@ from free_gateway import FreeGateway
 from parsing_engine import ParsingEngine
 from vector_store import VectorStore
 from wiki_vault import WikiVault, export_on_mission_enabled
+from phases import (
+    MissionContext, MissionPhase, DEFAULT_PHASES,
+    PlanningPhase, ResearchPhase, EvaluationPhase, SynthesisPhase, IngestionPhase,
+)
+import metrics as tangle_metrics
 
 logger = logging.getLogger("tangle.orchestrator")
 
@@ -66,6 +72,9 @@ AGENT_DEFS = {
 }
 
 class AgentOrchestrator:
+    # Agent definitions (prompts and metadata)
+    AGENT_DEFS = AGENT_DEFS
+
     # Agent → preferred free model (tiered by role fit, context length, and reliability).
     # Order = fallback order within each tier. Top of list = best first choice.
     AGENT_MODELS = {
@@ -118,10 +127,12 @@ class AgentOrchestrator:
         self.vector_store = VectorStore()
         self.wiki_vault = WikiVault()
         self.callbacks: List[Callable[[Dict], None]] = []
-        self._running = False
+        self._missions: Dict[str, MissionContext] = {}  # concurrent mission tracking
         self._current_mission_id: Optional[str] = None  # threaded to gateway for cost tracking
         # Global fallback only; delegate() prefers agent-specific list above.
         self.default_model = "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+        # Phase pipeline (configurable via subclass or injection)
+        self._phases: List[MissionPhase] = [phase(self) for phase in DEFAULT_PHASES]
 
     def _ctx(self) -> dict:
         """Build agent_context dict for gateway calls (carries mission_id)."""
@@ -297,6 +308,7 @@ class AgentOrchestrator:
 
         Free for basic usage — 20 req/min without API key, 500 with.
         """
+        from urllib.parse import quote
         jina_token = os.getenv("JINA_API_KEY", "")
         jina_headers: Dict[str, str] = {
             "Accept": "text/plain",
@@ -307,7 +319,7 @@ class AgentOrchestrator:
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 resp = await client.get(
-                    f"https://s.jina.ai/?q={httpx.URLEscaper().quote(query)}",
+                    f"https://s.jina.ai/?q={quote(query)}",
                     headers=jina_headers,
                 )
                 if resp.status_code == 200:
@@ -325,16 +337,44 @@ class AgentOrchestrator:
             logger.warning(f"Jina AI search failed: {e}")
         return "", []
 
+    async def _search_duckduckgo(self, query: str, agent_id: str) -> tuple[str, List[str]]:
+        """Search via DuckDuckGo (free, no API key needed). Returns (formatted_markdown, urls)."""
+        try:
+            from ddgs import DDGS
+            results = []
+            urls = []
+            for r in DDGS().text(query, max_results=5):
+                title = r.get("title", "")
+                body = r.get("body", "")
+                url = r.get("href", "")
+                if title and body:
+                    results.append(f"### {title}\n{body}\n")
+                    if url:
+                        urls.append(url)
+            if results:
+                content = "\n".join(results)
+                self._emit({
+                    "type": "tool_result",
+                    "agent_id": agent_id,
+                    "tool": "duckduckgo_search",
+                    "result": f"DuckDuckGo: {len(content)} chars, {len(urls)} URLs",
+                })
+                return content, urls
+        except Exception as e:
+            logger.warning(f"DuckDuckGo search failed: {e}")
+        return "", []
+
     async def search(self, query: str, agent_id: str = "scout") -> str:
         """Tool 2: Web search via Jina, Exa, or Crawl4AI depending on SCOUT_SOURCE.
 
         Sources (TANGLE_SCOUT_SOURCE env var):
-          jina       → Jina AI search (default, free, no key needed)
+          jina       → Jina AI search (default, needs JINA_API_KEY)
           exa        → Exa AI-native search (20k free req/month, needs EXA_API_KEY)
           crawl4ai   → Jina + Crawl4AI deep-crawl
           exa-crawl  → Exa + Crawl4AI deep-crawl
           both       → Jina + Crawl4AI deep-crawl
 
+        Falls back to DuckDuckGo (free, no key) if Jina fails.
         Falls back to OpenRouter LLM search if all search providers are unreachable.
         """
         self._emit({"type": "tool_call", "agent_id": agent_id, "tool": "search", "args": {"query": query}})
@@ -353,6 +393,11 @@ class AgentOrchestrator:
         else:
             primary_content, urls = await self._search_jina(query, agent_id)
             source_label = "Jina AI"
+            # Fallback to DuckDuckGo if Jina returns nothing
+            if not primary_content:
+                logger.info("Jina returned empty, trying DuckDuckGo fallback")
+                primary_content, urls = await self._search_duckduckgo(query, agent_id)
+                source_label = "DuckDuckGo"
 
         # ── 2. Deep Crawl (shared logic) ────────────────────
         crawl_content = ""
@@ -744,170 +789,70 @@ class AgentOrchestrator:
     # ─────────────────────────────────────────────────────────────
 
     async def run_mission(self, entity_name: str, uploaded_filepath: Optional[str] = None) -> Dict[str, Any]:
-        """Runs the complete assistance research mission from start to finish"""
-        self._running = True
+        """Runs the complete assistance research mission from start to finish.
+
+        Uses the phase pipeline for modularity and concurrent mission support.
+        """
         mission_id = str(uuid.uuid4())
-        self._current_mission_id = mission_id  # threaded to gateway for cost tracking
+        self._current_mission_id = mission_id
+
+        # Initialize mission context
+        ctx = MissionContext(
+            mission_id=mission_id,
+            entity_name=entity_name,
+            uploaded_filepath=uploaded_filepath,
+        )
+
+        # Track mission for concurrent execution
+        self._missions[mission_id] = ctx
+
+        # Track metrics
+        tangle_metrics.increment_active_missions()
+        mission_start = time.time()
 
         self._emit({"type": "workflow_step", "agent_id": "maestro", "task": f"Starting help mission for {entity_name}"})
         self._emit({"type": "agent_start", "agent_id": "maestro", "task": f"Analyze entity: {entity_name}"})
 
-        # Step 1: Ingest file if provided
-        wiki_entry = None
-        if uploaded_filepath:
-            wiki_entry = await self.ingest(uploaded_filepath, entity_name)
+        try:
+            # Step 1: Ingest file if provided (inline, not a phase)
+            if uploaded_filepath:
+                ctx.wiki_entry = await self.ingest(uploaded_filepath, entity_name)
 
-        # Step 2: Planning Phase
-        self._emit({"type": "agent_think", "agent_id": "planner", "turn": 1})
-        plan_prompt = f"Develop a plan to research ways to help '{entity_name}'."
-        if wiki_entry:
-            plan_prompt += f" We have ingested files containing: {wiki_entry['raw_content'][:500]}"
+            # Execute phase pipeline
+            for phase in self._phases:
+                ctx = await phase.execute(ctx)
 
-        messages_plan = [
-            {"role": "system", "content": AGENT_DEFS["planner"]["prompt"].format(entity=entity_name)},
-            {"role": "user", "content": plan_prompt}
-        ]
+            # Record success metrics
+            mission_duration = time.time() - mission_start
+            tangle_metrics.record_mission_latency(mission_duration, status="success")
 
-        plan_resp = await self.gateway.chat(self.default_model, messages_plan, agent_context=self._ctx())
-        plan = plan_resp.get("content", "Research the entity.")
-        self._emit({"type": "agent_complete", "agent_id": "planner", "result": plan[:400] + "..."})
-
-        # Step 3: Dispatch Scout and Librarian in parallel
-        self._emit({"type": "workflow_step", "agent_id": "maestro", "task": "Dispatching Research Agents"})
-
-        scout_task = self.delegate(f"Search for external background, vulnerabilities, and solutions for {entity_name}.", "scout", entity_name)
-
-        if wiki_entry:
-            lib_task = self.delegate(f"Extract all relevant help insights and details for {entity_name} from the uploaded documents.", "librarian", entity_name)
-            findings = await asyncio.gather(scout_task, lib_task)
-        else:
-            scout_result = await scout_task
-            findings = [scout_result]
-
-        # Step 4: Critique Phase (Evaluation Gate Loop)
-        self._emit({"type": "workflow_step", "agent_id": "maestro", "task": "Evaluating gathered facts"})
-
-        combined_text = "\n\n".join(findings)
-        evaluation = await self.evaluate(
-            combined_text,
-            f"Does this content explain the situation of '{entity_name}' and provide concrete ways to help?"
-        )
-
-        # If low score, run scout again with refined queries (N retries with exponential backoff)
-        MAX_RETRIES = int(os.getenv("TANGLE_ORCHESTRATOR_MAX_RETRIES", "3"))
-        retry_count = 0
-        while not evaluation["passed"] and retry_count < MAX_RETRIES:
-            retry_count += 1
-            backoff_s = 2 ** (retry_count - 1)  # 1s, 2s, 4s
-            logger.info(
-                f"Evaluation gate failed (attempt {retry_count}/{MAX_RETRIES}). "
-                f"Backing off {backoff_s}s before retry."
-            )
-            self._emit({
-                "type": "workflow_step", "agent_id": "maestro",
-                "task": f"Gate failed (attempt {retry_count}/{MAX_RETRIES}). "
-                        f"Retrying in {backoff_s}s: {evaluation['critique'][:80]}"
-            })
-            await asyncio.sleep(backoff_s)
-            retry_findings = await self.delegate(
-                f"Perform deeper research based on this critique: {evaluation['critique']}",
-                "scout",
-                entity_name
-            )
-            findings.append(retry_findings)
-
-            # Re-evaluate after retry
-            combined_text = "\n\n".join(findings)
-            evaluation = await self.evaluate(
-                combined_text,
-                f"Does this content explain the situation of '{entity_name}' and provide concrete ways to help?"
-            )
-
-        if not evaluation["passed"]:
-            logger.warning(
-                f"Evaluation gate still failing after {MAX_RETRIES} retries. "
-                f"Continuing with best-effort synthesis."
-            )
-            self._emit({
-                "type": "workflow_step", "agent_id": "maestro",
-                "task": f"Gate still failing after {MAX_RETRIES} retries. Using best-effort."
-            })
-
-        # Step 5: Synthesize final output (dual output: report_markdown + wiki_entry_markdown)
-        self._emit({"type": "workflow_step", "agent_id": "maestro", "task": "Synthesizing master report"})
-        synth_result = await self.synthesize(
-            findings,
-            entity_name,
-            critic_score=evaluation.get("score"),
-            verified=evaluation.get("verified", False),
-        )
-        final_report = synth_result["report_markdown"]
-        wiki_entry_markdown = synth_result["wiki_entry_markdown"]
-        wiki_chunk_id = synth_result["wiki_entry_chunk_id"]
-
-        self.vector_store.save_mission(mission_id, entity_name, final_report)
-        self._emit({"type": "agent_complete", "agent_id": "maestro", "result": "Mission complete. Report generated."})
-
-        # Feed the synthesized wiki entry back into the vector store so future missions
-        # for this entity can recall this synthesis. Self-feeding knowledge base.
-        if wiki_entry_markdown:
-            try:
-                synth_parsed = {
-                    "chunk_id": wiki_chunk_id,
-                    "filename": f"tangle-synthesis-{entity_name.lower().replace(' ', '-')[:40]}.md",
-                    "filepath": f"synthesized/{wiki_chunk_id}.md",
-                    "raw_content": wiki_entry_markdown,  # use the wiki-spec markdown as the raw content for vector embedding
-                    "markdown": wiki_entry_markdown,
-                    "confidence": self._confidence_from_critic(
-                        evaluation.get("score"), evaluation.get("verified", False)
-                    ),
-                    "timestamp": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
-                    "is_image": False,
-                    "parse_error": None,
-                }
-                await self.vector_store.add_wiki_entry(synth_parsed, entity_name)
-                self._emit({"type": "wiki_entry_added", "chunk_id": wiki_chunk_id, "entity": entity_name})
-                logger.info(f"Re-ingested synthesized wiki entry {wiki_chunk_id} for entity {entity_name}")
-            except Exception as e:
-                logger.error(f"Failed to re-ingest synthesized wiki entry: {e}")
-
-        # Pull usage stats for this mission from the gateway
-        usage = self.gateway.get_mission_usage(mission_id) if hasattr(self.gateway, "get_mission_usage") else {}
-
-        # Refresh the Obsidian-compatible wiki vault so docs/wiki/ stays in sync
-        # with whatever just landed in SQLite (original upload + synthesized entry).
-        # Best-effort: a vault export failure must not break the mission response.
-        wiki_export_summary: Optional[Dict[str, Any]] = None
-        if export_on_mission_enabled():
-            try:
-                wiki_export_summary = self.wiki_vault.export_all()
-                self._emit({
-                    "type": "wiki_vault_exported",
-                    "vault_root": wiki_export_summary.get("vault_root"),
-                    "chunks": wiki_export_summary.get("chunks"),
-                    "entities": wiki_export_summary.get("entities"),
-                })
-            except Exception as e:
-                logger.warning(f"Wiki vault auto-export after mission failed: {e}")
-
-        self._running = False
-        return {
-            "mission_id": mission_id,
-            "entity_name": entity_name,
-            # Backwards compat: frontend reads `data.report` and parses the wiki-nodes JSON block
-            "report": final_report,
-            # New: explicit dual-output fields
-            "report_markdown": final_report,
-            "wiki_entry_markdown": wiki_entry_markdown,
-            "wiki_entry_chunk_id": wiki_chunk_id,
-            # Source-of-truth fields
-            "wiki_entry": wiki_entry,  # the originally uploaded file's wiki entry (if any)
-            "verified": evaluation.get("verified", False),
-            "critic_score": evaluation.get("score"),
-            "critic_critique": evaluation.get("critique"),
-            "usage": usage,
-            "wiki_export": wiki_export_summary,
-        }
+            return {
+                "mission_id": ctx.mission_id,
+                "entity_name": ctx.entity_name,
+                # Backwards compat: frontend reads `data.report` and parses the wiki-nodes JSON block
+                "report": ctx.report_markdown,
+                # New: explicit dual-output fields
+                "report_markdown": ctx.report_markdown,
+                "wiki_entry_markdown": ctx.wiki_entry_markdown,
+                "wiki_entry_chunk_id": ctx.wiki_entry_chunk_id,
+                # Source-of-truth fields
+                "wiki_entry": ctx.wiki_entry,
+                "verified": ctx.evaluation.get("verified", False),
+                "critic_score": ctx.evaluation.get("score"),
+                "critic_critique": ctx.evaluation.get("critique"),
+                "usage": ctx.usage,
+                "wiki_export": ctx.wiki_export_summary,
+            }
+        except Exception as e:
+            # Record failure metrics
+            mission_duration = time.time() - mission_start
+            tangle_metrics.record_mission_latency(mission_duration, status="failed")
+            raise
+        finally:
+            # Always clean up mission tracking
+            self._missions.pop(mission_id, None)
+            self._current_mission_id = None
+            tangle_metrics.decrement_active_missions()
 
     async def execute(self, agent_id: str, task: str, max_turns: int = 6) -> dict:
         """Route execute to delegate for backwards compatibility with CLI/Chat panel"""
@@ -925,4 +870,15 @@ class AgentOrchestrator:
         return {"results": results}
 
     def stop(self):
-        self._running = False
+        """Stop all running missions."""
+        self._missions.clear()
+        self._current_mission_id = None
+
+    @property
+    def _running(self) -> bool:
+        """Check if any missions are running (for backward compatibility)."""
+        return len(self._missions) > 0
+
+    def get_active_missions(self) -> List[str]:
+        """Return list of active mission IDs."""
+        return list(self._missions.keys())

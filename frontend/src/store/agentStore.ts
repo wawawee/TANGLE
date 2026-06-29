@@ -63,6 +63,38 @@ export interface AgentVerboseLog {
   }>;
 }
 
+const TELEMETRY_LS_KEY = 'tangle-telemetry-log';
+
+/** Rehydrate telemetry from localStorage on store creation. */
+function loadTelemetry(): TelemetryEvent[] {
+  try {
+    const raw = localStorage.getItem(TELEMETRY_LS_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    // Recover eventCounter from highest ID number
+    for (const ev of parsed) {
+      const m = typeof ev.id === 'string' ? /^evt-(\d+)$/.exec(ev.id) : null;
+      if (m) {
+        const n = parseInt(m[1], 10);
+        if (n > eventCounter) eventCounter = n;
+      }
+    }
+    return parsed;
+  } catch {
+    return [];
+  }
+}
+
+/** Persist telemetry to localStorage (fire-and-forget, best-effort). */
+function persistTelemetry(log: TelemetryEvent[]): void {
+  try {
+    localStorage.setItem(TELEMETRY_LS_KEY, JSON.stringify(log.slice(0, 200)));
+  } catch {
+    // localStorage full or unavailable — silently ignore
+  }
+}
+
 interface AgentStore {
   agentStatuses: Record<string, AgentStatus>;
   activeEdges: Set<string>;
@@ -133,7 +165,7 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
   activeEdges: new Set(),
   visibleNodes: new Set(['orchestrator']), // Orchestrator is always visible
   visibleEdges: new Set(),
-  telemetryLog: [],
+  telemetryLog: loadTelemetry(),
   activeFlow: 'none',
   systemMetrics: null,
   qdrantCollections: MOCK_QDRANT_COLLECTIONS,
@@ -228,10 +260,20 @@ export const useAgentStore = create<AgentStore>((set, get) => ({
       id: `evt-${++eventCounter}`,
       timestamp: format(new Date(), 'HH:mm:ss.SSS'),
     };
-    set(s => ({ telemetryLog: [full, ...s.telemetryLog].slice(0, 200) }));
+    const next: TelemetryEvent[] = [];
+    set(s => {
+      const updated = [full, ...s.telemetryLog].slice(0, 200);
+      next.push(...updated);
+      return { telemetryLog: updated };
+    });
+    // Persist outside set to avoid stale closure — next is populated in the same tick
+    if (next.length > 0) persistTelemetry(next);
   },
 
-  clearTelemetry: () => set({ telemetryLog: [] }),
+  clearTelemetry: () => {
+    set({ telemetryLog: [] });
+    persistTelemetry([]);
+  },
 
   setActiveFlow: (flow) => set({ activeFlow: flow }),
 

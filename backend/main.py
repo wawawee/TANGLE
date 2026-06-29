@@ -1,5 +1,6 @@
-from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, UploadFile, File, Form, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 from pydantic import BaseModel
 from typing import Optional
 import psutil
@@ -14,12 +15,40 @@ from datetime import datetime, timezone
 from pathlib import Path
 from dotenv import load_dotenv
 import httpx
+from collections import defaultdict
+import time as _time
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
+# Simple in-memory rate limiter (single-user local, no Redis needed)
+_rate_limits: dict[str, list[float]] = defaultdict(list)
+
+def _check_rate_limit(key: str, max_requests: int = 30, window: float = 60.0) -> bool:
+    """Return True if request is allowed, False if rate-limited."""
+    now = _time.time()
+    _rate_limits[key] = [t for t in _rate_limits[key] if now - t < window]
+    if len(_rate_limits[key]) >= max_requests:
+        return False
+    _rate_limits[key].append(now)
+    return True
+
+# Structured JSON logging support
+from pythonjsonlogger import jsonlogger
+
+# Configure logging - JSON format if TANGLE_LOG_JSON=true, else human-readable
+log_json = os.getenv("TANGLE_LOG_JSON", "false").lower() in ("true", "1", "yes")
+if log_json:
+    log_handler = logging.StreamHandler()
+    formatter = jsonlogger.JsonFormatter(
+        fmt="%(asctime)s %(levelname)s %(name)s %(message)s",
+        datefmt="%Y-%m-%dT%H:%M:%S",
+    )
+    log_handler.setFormatter(formatter)
+    logging.basicConfig(level=logging.INFO, handlers=[log_handler])
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
 logger = logging.getLogger("tangle.api")
 
 # Load .env from repo root (parent of backend/) regardless of CWD
@@ -48,6 +77,7 @@ from task_manager import TaskListManager
 from kanban_store import KanbanBoard
 from run_history import RunHistory
 from wiki_vault import WikiVault
+import metrics as tangle_metrics
 
 gateway = FreeGateway()
 orchestrator = AgentOrchestrator(gateway)
@@ -59,6 +89,12 @@ run_history = RunHistory()
 wiki_vault = WikiVault()
 
 app = FastAPI(title="TANGLE Agentic API")
+
+@app.on_event("startup")
+async def startup_event():
+    """Initialize metrics on startup."""
+    tangle_metrics.init_metrics()
+    logger.info("TANGLE API started")
 
 app.add_middleware(
     CORSMiddleware,
@@ -80,6 +116,17 @@ async def health_check():
         "agents": 16,
         "timestamp": datetime.utcnow().isoformat()
     }
+
+# ─────────────────────────────────────────────────────────────
+# Prometheus Metrics
+# ─────────────────────────────────────────────────────────────
+@app.get("/metrics")
+async def metrics():
+    """Prometheus metrics endpoint."""
+    return Response(
+        content=tangle_metrics.get_metrics(),
+        media_type=tangle_metrics.get_metrics_content_type()
+    )
 
 # ─────────────────────────────────────────────────────────────
 # Agents
@@ -368,22 +415,40 @@ async def execute_agent_lg(req: LangGraphRequest):
 
 @app.post("/api/upload")
 async def upload_file(file: UploadFile = File(...), entity: str = Form(...)):
+    if not _check_rate_limit("upload", max_requests=10, window=60.0):
+        raise HTTPException(status_code=429, detail="Rate limit: max 10 uploads per minute")
+    if not entity or not entity.strip() or len(entity) > 500:
+        raise HTTPException(status_code=400, detail="Entity name required (max 500 chars)")
     try:
         logger.info(f"Uploading file {file.filename} for entity {entity}")
         uploads_dir = Path(__file__).parent.parent / "uploads"
         uploads_dir.mkdir(exist_ok=True)
-        file_path = uploads_dir / file.filename
-        
+
+        # Sanitize filename: strip path components to prevent path traversal
+        safe_name = Path(file.filename).name  # removes any directory parts
+        if not safe_name or safe_name.startswith("."):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+        # Block extremely long names
+        if len(safe_name) > 255:
+            safe_name = safe_name[:255]
+
+        file_path = uploads_dir / safe_name
+        # Final check: resolved path must be inside uploads_dir
+        if not file_path.resolve().is_relative_to(uploads_dir.resolve()):
+            raise HTTPException(status_code=400, detail="Invalid file path")
+
         with open(file_path, "wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
-            
+
         parsed_data = await orchestrator.ingest(str(file_path), entity)
         return {
             "success": True,
-            "filename": file.filename,
+            "filename": safe_name,
             "filepath": str(file_path),
             "parsed": parsed_data
         }
+    except HTTPException:
+        raise
     except Exception as e:
         logger.error(f"Upload failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
@@ -392,8 +457,16 @@ class MissionRequest(BaseModel):
     entity: str
     filepath: Optional[str] = None
 
+    def model_post_init(self, __context) -> None:
+        if not self.entity or not self.entity.strip():
+            raise ValueError("Entity name is required")
+        if len(self.entity) > 500:
+            raise ValueError("Entity name too long (max 500 chars)")
+
 @app.post("/api/mission/start")
 async def start_mission(req: MissionRequest):
+    if not _check_rate_limit("mission", max_requests=5, window=60.0):
+        raise HTTPException(status_code=429, detail="Rate limit: max 5 missions per minute")
     try:
         logger.info(f"Starting assistance mission for entity: {req.entity}, file: {req.filepath}")
         result = await orchestrator.run_mission(req.entity, req.filepath)
@@ -443,6 +516,49 @@ async def run_review_harness(req: ReviewHarnessRequest):
 async def stop_agents():
     orchestrator.stop()
     return {"status": "stopped"}
+
+# ─────────────────────────────────────────────────────────────
+# Multi-entity & mission history endpoints
+# ─────────────────────────────────────────────────────────────
+@app.get("/api/entities")
+async def list_entities():
+    """List all unique entities with mission/wiki counts, sorted by most recent."""
+    try:
+        entities = orchestrator.vector_store.list_entities()
+        return {"entities": entities, "count": len(entities)}
+    except Exception as e:
+        logger.error(f"Failed to list entities: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/missions")
+async def list_missions(entity: str = "", limit: int = 20):
+    """List missions, optionally filtered by entity name. Most recent first."""
+    try:
+        if entity:
+            missions = orchestrator.vector_store.list_missions_for_entity(entity, limit)
+        else:
+            # Simple: return all missions across all entities
+            conn = sqlite3.connect(orchestrator.vector_store.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM missions ORDER BY timestamp DESC LIMIT ?",
+                (limit,),
+            )
+            rows = cursor.fetchall()
+            conn.close()
+            missions = []
+            for row in rows:
+                missions.append({
+                    "mission_id": row[0],
+                    "entity_name": row[1],
+                    "status": row[2],
+                    "report": row[3],
+                    "timestamp": row[4],
+                })
+        return {"missions": missions, "count": len(missions)}
+    except Exception as e:
+        logger.error(f"Failed to list missions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────────────────────
 # Config endpoint for frontend

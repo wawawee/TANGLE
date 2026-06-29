@@ -25,6 +25,8 @@ import AgentVerbosePanel from './components/AgentVerbosePanel';
 import ChatBox from './components/ChatBox';
 import CliHarness from './components/CliHarness';
 import EdgeTelemetry from './components/EdgeTelemetry';
+import EntitySelector from './components/EntitySelector';
+import ErrorBoundary from './components/ErrorBoundary';
 import Experience3D from './components/Experience3D';
 import IndexPanel from './components/IndexPanel';
 
@@ -139,6 +141,7 @@ function TangleCanvas() {
   const [nodes, setNodes, _onNodesChange] = useNodesState<Node>([]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
 
+  const [showEntities, setShowEntities] = useState(false);
   const [showTerminal, setShowTerminal] = useState(false);
   const [showLogs, setShowLogs] = useState(false);
   const [showIndex, setShowIndex] = useState(false);
@@ -164,10 +167,12 @@ function TangleCanvas() {
   const [isDragging, setIsDragging] = useState(false);
   const [promptValue, setPromptValue] = useState('');
   const [promptEntity, setPromptEntity] = useState('');
+  const [activeEntity, setActiveEntity] = useState<string | null>(null);
   const [entityFilepaths, setEntityFilepaths] = useState<Record<string, string>>({});
   const [isUploading, setIsUploading] = useState(false);
   const [isMissionRunning, setIsMissionRunning] = useState(false);
   const [missionEntity, setMissionEntity] = useState<string | null>(null);
+  const [currentMissionStep, setCurrentMissionStep] = useState<string>('');
 
   // ─── localStorage persistence ─────────────────────────────
   const initialLoadDone = useRef(false);
@@ -413,6 +418,28 @@ function TangleCanvas() {
     setIsMissionRunning(true);
     setMissionEntity(finalEntity);
     setPromptEntity('');
+    setCurrentMissionStep('Starting mission…');
+
+    // Update step based on pipeline agent statuses via polling (setInterval)
+    const stepNames: Record<string, string> = {
+      planner:     '🧠 Planning research strategy',
+      scout:       '🔍 Searching online sources',
+      librarian:   '📚 Querying internal knowledge',
+      critic:      '⚖️ Evaluating findings',
+      synthesizer: '✨ Synthesizing final report',
+    };
+    const stepPoll = setInterval(() => { // eslint-disable-line prefer-const
+      const statuses = useAgentStore.getState().agentStatuses;
+      for (const step of ['synthesizer', 'critic', 'librarian', 'scout', 'planner'] as const) {
+        const s = statuses[step];
+        if (s === 'thinking' || s === 'executing') {
+          setCurrentMissionStep(stepNames[step] || step);
+          return;
+        }
+      }
+      // All idle — mission probably done or not started
+      setCurrentMissionStep('Waiting for pipeline…');
+    }, 500);
 
     // Hook up WebSocket for live pipeline status
     connectWs();
@@ -575,7 +602,7 @@ function TangleCanvas() {
 
         <div style={{ display: 'flex', gap: 6 }}>
           <button
-            onClick={() => { setShowIndex(!showIndex); if (!showIndex) { setShowTerminal(false); setShowLogs(false); } }}
+            onClick={() => { setShowIndex(!showIndex); if (!showIndex) { setShowTerminal(false); setShowLogs(false); setShowEntities(false); } }}
             style={{
               ...s.terminalBtn(showIndex),
               borderColor: showIndex ? '#a855f760' : 'var(--border)',
@@ -586,13 +613,24 @@ function TangleCanvas() {
             INDEX
           </button>
           <button
-            onClick={() => { setShowTerminal(!showTerminal); if (!showTerminal) { setShowLogs(false); setShowIndex(false); } }}
+            onClick={() => { setShowEntities(!showEntities); if (!showEntities) { setShowTerminal(false); setShowLogs(false); setShowIndex(false); } }}
+            style={{
+              ...s.terminalBtn(showEntities),
+              borderColor: showEntities ? '#c084fc60' : 'var(--border)',
+              color: showEntities ? '#c084fc' : 'var(--text-dim)',
+            }}
+            title="Entity browser — all entities with missions and files"
+          >
+            ENTITIES
+          </button>
+          <button
+            onClick={() => { setShowTerminal(!showTerminal); if (!showTerminal) { setShowLogs(false); setShowIndex(false); setShowEntities(false); } }}
             style={s.terminalBtn(showTerminal)}
           >
             CLI
           </button>
           <button
-            onClick={() => { setShowLogs(!showLogs); if (!showLogs) { setShowTerminal(false); setShowIndex(false); } }}
+            onClick={() => { setShowLogs(!showLogs); if (!showLogs) { setShowTerminal(false); setShowIndex(false); setShowEntities(false); } }}
             style={{
               ...s.terminalBtn(showLogs),
               borderColor: showLogs ? '#06b6d460' : 'var(--border)',
@@ -701,7 +739,7 @@ function TangleCanvas() {
               onChange={(e) => setPromptValue(e.target.value)}
               placeholder={
                 isUploading ? 'Uploading…' :
-                isMissionRunning ? `Helping ${missionEntity}…` :
+                isMissionRunning ? currentMissionStep || `Helping ${missionEntity}…` :
                 'Help [entity]'
               }
               disabled={isUploading || isMissionRunning}
@@ -779,22 +817,52 @@ function TangleCanvas() {
             transition: 'width 0.3s',
             overflow: 'hidden',
             flexShrink: 0,
-            width: showTerminal || showLogs || showIndex ? SIDE_PANEL_WIDTH : 0,
+            width: showTerminal || showLogs || showIndex || showEntities ? SIDE_PANEL_WIDTH : 0,
           }}
         >
           {showIndex && (
             <div style={{ width: SIDE_PANEL_WIDTH, height: '100%', overflow: 'hidden' }}>
-              <IndexPanel />
+              <ErrorBoundary>
+                <IndexPanel />
+              </ErrorBoundary>
             </div>
           )}
           {showTerminal && (
             <div style={{ width: SIDE_PANEL_WIDTH, height: '100%', overflow: 'hidden' }}>
-              <CliHarness />
+              <ErrorBoundary>
+                <CliHarness />
+              </ErrorBoundary>
+            </div>
+          )}
+          {showEntities && (
+            <div style={{ width: SIDE_PANEL_WIDTH, height: '100%', overflow: 'hidden' }}>
+              <ErrorBoundary>
+                <EntitySelector
+                  activeEntity={activeEntity}
+                  onSelectEntity={(name) => {
+                    setActiveEntity(name);
+                    setPromptValue(name);
+                    setPromptEntity(name);
+                    // Ensure entity node exists on canvas
+                    const eid = `entity-${name.toLowerCase().replace(/\s+/g, '-')}`;
+                    setAllNodes(prev => prev.some(n => n.id === eid) ? prev : [...prev, {
+                      id: eid,
+                      type: 'entity',
+                      position: { x: 300 + Math.random() * 200, y: 100 + Math.random() * 200 },
+                      data: { entity: name, status: 'idle' },
+                      draggable: true,
+                    } as Node<EntityNodeData>]);
+                  }}
+                  onStartMission={(name) => handleStartMission(name)}
+                />
+              </ErrorBoundary>
             </div>
           )}
           {showLogs && (
             <div style={{ width: SIDE_PANEL_WIDTH, height: '100%', overflow: 'hidden' }}>
-              <AgentVerbosePanel />
+              <ErrorBoundary>
+                <AgentVerbosePanel />
+              </ErrorBoundary>
             </div>
           )}
         </div>

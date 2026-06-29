@@ -53,3 +53,7 @@ backend/venv/
 .tangle-kanban.json
 .tangle-plans/
 
+
+
+#Ignore vscode AI rules
+.github/instructions/codacy.instructions.md

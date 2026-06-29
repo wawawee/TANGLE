@@ -31,17 +31,39 @@ OPENROUTER_FREE_MODELS = [
     "meta-llama/llama-3.2-3b-instruct:free",          # small + fast bulk fallback
     # Tier 3: Last resort
     "cognitivecomputations/dolphin-mistral-24b-venice-edition:free",  # uncensored (use last)
+    "openrouter/free",                                              # auto-route to any available free model
 ]
 
 OLLAMA_CHAT_MODELS = ["llama3.2:3b", "llama3.1:8b", "qwen3:8b", "llama3.2:1b", "phi4-mini:3.8b"]
 
 class FreeGateway:
+    # Circuit breaker states
+    _CB_CLOSED = "closed"      # Normal operation
+    _CB_OPEN = "open"          # Failing fast, not calling provider
+    _CB_HALF_OPEN = "half_open"  # Probing with a single request
+
     def __init__(self):
         self.openrouter_key = os.getenv("OPENROUTER_API_KEY", "")
         self.gemini_key = os.getenv("GEMINI_API_KEY", "")
         self._client = httpx.AsyncClient(timeout=60)
         self._rate_limits = {"openrouter": {"remaining": 50, "reset": time.time() + 86400}}
         self._ollama_available = None
+
+        # Circuit breaker state per provider
+        self._cb: dict[str, dict] = {
+            "openrouter": {
+                "state": self._CB_CLOSED,
+                "failures": 0,
+                "opened_at": 0.0,
+                "cooldown": 30.0,  # doubles on each open, max 240s
+            },
+            "gemini": {
+                "state": self._CB_CLOSED,
+                "failures": 0,
+                "opened_at": 0.0,
+                "cooldown": 30.0,
+            },
+        }
 
     async def health(self) -> dict:
         """Check health of all providers."""
@@ -50,7 +72,98 @@ class FreeGateway:
             "gemini": bool(self.gemini_key),
             "ollama": await self._check_ollama(),
         }
+        # Add circuit breaker status
+        for provider, cb in self._cb.items():
+            if cb["state"] != self._CB_CLOSED:
+                health[f"{provider}_circuit"] = cb["state"]
         return health
+
+    # ── Circuit breaker helpers ─────────────────────────────────
+
+    def _cb_record_success(self, provider: str) -> None:
+        """Record a successful call — reset circuit breaker."""
+        cb = self._cb.get(provider)
+        if not cb:
+            return
+        if cb["state"] == self._CB_HALF_OPEN:
+            import logging
+            logging.getLogger("tangle.gateway").info(
+                f"Circuit breaker CLOSED for {provider} (probe succeeded)"
+            )
+        cb["state"] = self._CB_CLOSED
+        cb["failures"] = 0
+        cb["cooldown"] = 30.0
+
+    def _cb_record_failure(self, provider: str) -> None:
+        """Record a failed call — may open circuit breaker."""
+        cb = self._cb.get(provider)
+        if not cb:
+            return
+        cb["failures"] += 1
+        if cb["failures"] >= 3:
+            cb["state"] = self._CB_OPEN
+            cb["opened_at"] = time.time()
+            import logging
+            logging.getLogger("tangle.gateway").warning(
+                f"Circuit breaker OPEN for {provider} "
+                f"(cooldown {cb['cooldown']:.0f}s, {cb['failures']} consecutive failures)"
+            )
+
+    def _cb_should_allow(self, provider: str) -> bool:
+        """Check if the circuit breaker allows a request."""
+        cb = self._cb.get(provider)
+        if not cb:
+            return True
+        if cb["state"] == self._CB_CLOSED:
+            # Even when closed, check if rate limit is nearly exhausted
+            if provider == "openrouter":
+                rate = self._rate_limits.get("openrouter", {})
+                remaining = rate.get("remaining", 999)
+                reset = rate.get("reset", 0)
+                if remaining <= 1 and time.time() < reset:
+                    logger.warning(f"CircuitBreaker: openrouter rate near zero (remaining={remaining}, reset_in={reset - time.time():.0f}s) — OPENING")
+                    cb["state"] = self._CB_OPEN
+                    cb["opened_at"] = time.time()
+                    cb["cooldown"] = reset - time.time() + 1
+                    return False
+            return True
+        if cb["state"] == self._CB_HALF_OPEN:
+            return True  # Allow probe
+        # OPEN state — check if cooldown expired
+        elapsed = time.time() - cb["opened_at"]
+        if elapsed >= cb["cooldown"]:
+            cb["state"] = self._CB_HALF_OPEN
+            logger.info(f"Circuit breaker HALF_OPEN for {provider} (cooldown expired)")
+            return True
+        return False
+
+    def _cb_update_rate_from_headers(self, provider: str, headers: dict) -> None:
+        """Parse rate-limit headers from OpenRouter response.
+
+        OpenRouter returns per-request headers:
+          x-ratelimit-limit       — max requests in current window
+          x-ratelimit-remaining   — requests left in current window
+          x-ratelimit-reset       — epoch seconds when window resets
+        """
+        if provider == "openrouter":
+            remaining = headers.get("x-ratelimit-remaining")
+            reset = headers.get("x-ratelimit-reset")
+            limit = headers.get("x-ratelimit-limit")
+            if remaining is not None:
+                try:
+                    self._rate_limits["openrouter"]["remaining"] = int(remaining)
+                except (ValueError, TypeError):
+                    pass
+            if reset is not None:
+                try:
+                    self._rate_limits["openrouter"]["reset"] = float(reset)
+                except (ValueError, TypeError):
+                    pass
+            if limit is not None:
+                try:
+                    self._rate_limits["openrouter"]["limit"] = int(limit)
+                except (ValueError, TypeError):
+                    pass
 
     async def _check_ollama(self) -> bool:
         """Check if Ollama is running and accessible."""
@@ -105,6 +218,17 @@ class FreeGateway:
         if not self.openrouter_key:
             return await self._fallback_to_gemini(model, messages)
 
+        # Circuit breaker check
+        if not self._cb_should_allow("openrouter"):
+            import logging
+            cb = self._cb["openrouter"]
+            remaining_cooldown = cb["cooldown"] - (time.time() - cb["opened_at"])
+            logging.getLogger("tangle.gateway").info(
+                f"Circuit breaker OPEN for openrouter — "
+                f"falling back (cooldown {remaining_cooldown:.0f}s remaining)"
+            )
+            return await self._fallback_to_gemini(model, messages)
+
         remaining = self._rate_limits["openrouter"]["remaining"]
         if remaining <= 0:
             wait = self._rate_limits["openrouter"]["reset"] - time.time()
@@ -121,16 +245,30 @@ class FreeGateway:
             json=body,
         )
 
-        self._rate_limits["openrouter"]["remaining"] = max(0, remaining - 1)
+        # Parse rate-limit headers from OpenRouter
+        self._cb_update_rate_from_headers("openrouter", dict(resp.headers))
 
         if resp.status_code in (429, 503):
             if resp.status_code == 429:
                 self._rate_limits["openrouter"]["remaining"] = 0
-                self._rate_limits["openrouter"]["reset"] = time.time() + 60
+                # Use Retry-After header if present, else default to 60s
+                retry_after = resp.headers.get("retry-after")
+                if retry_after:
+                    try:
+                        self._rate_limits["openrouter"]["reset"] = time.time() + float(retry_after)
+                    except (ValueError, TypeError):
+                        self._rate_limits["openrouter"]["reset"] = time.time() + 60
+                else:
+                    self._rate_limits["openrouter"]["reset"] = time.time() + 60
+            self._cb_record_failure("openrouter")
             return await self._try_other_free_models(model, messages, tools)
 
         if resp.status_code != 200:
+            self._cb_record_failure("openrouter")
             return await self._try_other_free_models(model, messages, tools)
+
+        # Success — record it
+        self._cb_record_success("openrouter")
 
         data = resp.json()
         choice = data["choices"][0]
@@ -153,10 +291,15 @@ class FreeGateway:
         for fallback_model in OPENROUTER_FREE_MODELS:
             # Normalize: strip optional "openrouter/" prefix (for entries like openrouter/owl-alpha
             # whose ID does NOT carry a :free suffix), and strip optional :free suffix.
+            # Exception: keep "openrouter/free" as-is — it's a special routing endpoint.
             normalized = fallback_model
-            if normalized.startswith("openrouter/"):
+            if normalized == "openrouter/free":
+                pass  # keep full ID
+            elif normalized.startswith("openrouter/"):
                 normalized = normalized[len("openrouter/"):]
-            normalized = normalized.removesuffix(":free")
+                normalized = normalized.removesuffix(":free")
+            else:
+                normalized = normalized.removesuffix(":free")
 
             # Skip the model that just failed
             failed_normalized = failed_model
@@ -205,6 +348,16 @@ class FreeGateway:
         if not self.gemini_key:
             return {"error": "GEMINI_API_KEY not set", "provider": "gemini"}
 
+        if not self._cb_should_allow("gemini"):
+            import logging
+            cb = self._cb["gemini"]
+            remaining_cooldown = cb["cooldown"] - (time.time() - cb["opened_at"])
+            logging.getLogger("tangle.gateway").info(
+                f"Circuit breaker OPEN for gemini — "
+                f"skipping (cooldown {remaining_cooldown:.0f}s remaining)"
+            )
+            return {"error": f"Circuit breaker open for gemini (cooldown {remaining_cooldown:.0f}s)", "provider": "gemini"}
+
         contents = self._convert_to_gemini(messages)
         model_name = model.replace("gemini/", "")
 
@@ -215,8 +368,10 @@ class FreeGateway:
         )
 
         if resp.status_code != 200:
+            self._cb_record_failure("gemini")
             return {"error": f"Gemini {resp.status_code}: {resp.text[:200]}", "provider": "gemini"}
 
+        self._cb_record_success("gemini")
         data = resp.json()
         candidate = data.get("candidates", [{}])[0]
         content = candidate.get("content", {}).get("parts", [{}])[0].get("text", "")

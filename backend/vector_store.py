@@ -6,8 +6,16 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional
 import httpx
+import asyncio
 
 logger = logging.getLogger("tangle.vector")
+
+try:
+    import aiosqlite
+    AIOSQLITE_AVAILABLE = True
+except ImportError:
+    AIOSQLITE_AVAILABLE = False
+    logger.warning("aiosqlite not installed. Using sync SQLite connections.")
 
 try:
     from qdrant_client import QdrantClient
@@ -71,6 +79,10 @@ class VectorStore:
         self.db_path = os.path.join(os.path.dirname(__file__), "tangle.db")
         self._init_sqlite()
         
+        # Async SQLite connection pool (aiosqlite)
+        self._db_pool = None
+        self._pool_lock = asyncio.Lock()
+        
         self.qclient = None
         if QDRANT_AVAILABLE:
             try:
@@ -88,6 +100,21 @@ class VectorStore:
         self.supabase = _supabase_client if SUPABASE_AVAILABLE else None
         if self.supabase:
             self._init_supabase()
+
+    async def _get_db_pool(self):
+        """Get or create async SQLite connection pool."""
+        if self._db_pool is None:
+            async with self._pool_lock:
+                if self._db_pool is None:
+                    if AIOSQLITE_AVAILABLE:
+                        self._db_pool = await aiosqlite.connect(self.db_path)
+                        # Enable WAL mode for better concurrent read performance
+                        await self._db_pool.execute("PRAGMA journal_mode=WAL")
+                        await self._db_pool.execute("PRAGMA busy_timeout=5000")
+                        logger.info("Async SQLite connection pool initialized")
+                    else:
+                        logger.warning("aiosqlite not available, using sync connections")
+        return self._db_pool
 
     def _init_sqlite(self):
         """Initializes the local fallback SQLite database for relational state/wiki metadata"""
@@ -208,6 +235,92 @@ class VectorStore:
         # sha256 fallback (deterministic, no model)
         return self._generate_dummy_vector(text)
 
+    async def get_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings for multiple texts in a single Ollama call.
+
+        This is more efficient than calling get_embeddings() multiple times.
+        Uses Ollama's batch embedding API (/api/embed with list input).
+        """
+        if not texts:
+            return []
+
+        if EMBEDDING_SOURCE == "ollama":
+            return await self._get_ollama_embeddings_batch(texts)
+
+        # For other sources, fall back to individual calls
+        results = []
+        for text in texts:
+            vec = await self.get_embeddings(text)
+            results.append(vec)
+        return results
+
+    async def _get_ollama_embeddings_batch(self, texts: List[str]) -> List[List[float]]:
+        """Generate embeddings for multiple texts via Ollama batch API."""
+        import time
+        start_time = time.time()
+
+        payload: Dict[str, Any] = {
+            "model": EMBEDDING_MODEL,
+            "input": texts,  # Ollama supports list input for batch embedding
+        }
+        gpu_cap = os.getenv("OLLAMA_NUM_GPU")
+        if gpu_cap:
+            try:
+                payload["options"] = {"num_gpu": int(gpu_cap)}
+            except ValueError:
+                logger.warning(f"OLLAMA_NUM_GPU={gpu_cap!r} not an int, ignoring")
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.post(
+                    f"{OLLAMA_BASE}/api/embed",
+                    json=payload,
+                    timeout=120,
+                )
+                duration = time.time() - start_time
+
+                if resp.status_code == 200:
+                    data = resp.json()
+                    vecs = data.get("embeddings") or []
+                    if vecs and len(vecs) == len(texts):
+                        # Validate dimensions
+                        valid_vecs = []
+                        for i, vec in enumerate(vecs):
+                            if len(vec) == EMBEDDING_DIM:
+                                valid_vecs.append(vec)
+                            else:
+                                logger.error(
+                                    f"Ollama embedding dim mismatch for text {i}: "
+                                    f"got {len(vec)}, expected {EMBEDDING_DIM}"
+                                )
+                                valid_vecs.append(self._generate_dummy_vector(texts[i]))
+
+                        # Record metrics
+                        try:
+                            import metrics as tangle_metrics
+                            tangle_metrics.record_embedding_latency("ollama", duration, len(texts))
+                        except ImportError:
+                            pass
+
+                        logger.info(f"Batch embedding completed: {len(texts)} texts in {duration:.2f}s")
+                        return valid_vecs
+                    else:
+                        logger.error(
+                            f"Ollama batch embedding count mismatch: "
+                            f"got {len(vecs)}, expected {len(texts)}"
+                        )
+                else:
+                    logger.error(f"Ollama batch embedding error {resp.status_code}: {resp.text[:200]}")
+        except Exception as e:
+            logger.error(f"Ollama batch embedding failed: {e}")
+
+        # Fallback to individual calls
+        results = []
+        for text in texts:
+            vec = await self._get_ollama_embeddings(text)
+            results.append(vec)
+        return results
+
     async def _get_ollama_embeddings(self, text: str) -> List[float]:
         """Generate embeddings via local Ollama. Default model: qwen3-embedding:8b.
 
@@ -265,14 +378,22 @@ class VectorStore:
         timestamp = parsed_data["timestamp"]
 
         # 1. Save to Relational DB (SQLite — source of truth)
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "INSERT OR REPLACE INTO wiki_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-            (chunk_id, entity_name, filename, filepath, raw_content, markdown, confidence, timestamp)
-        )
-        conn.commit()
-        conn.close()
+        if AIOSQLITE_AVAILABLE:
+            db = await self._get_db_pool()
+            await db.execute(
+                "INSERT OR REPLACE INTO wiki_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (chunk_id, entity_name, filename, filepath, raw_content, markdown, confidence, timestamp)
+            )
+            await db.commit()
+        else:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "INSERT OR REPLACE INTO wiki_entries VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (chunk_id, entity_name, filename, filepath, raw_content, markdown, confidence, timestamp)
+            )
+            conn.commit()
+            conn.close()
 
         # 1b. Mirror to Supabase (best-effort, non-blocking)
         if self.supabase:
@@ -401,12 +522,21 @@ class VectorStore:
                 
                 # Fetch full data from sqlite
                 if chunk_ids:
-                    conn = sqlite3.connect(self.db_path)
-                    cursor = conn.cursor()
-                    placeholders = ",".join("?" for _ in chunk_ids)
-                    cursor.execute(f"SELECT * FROM wiki_entries WHERE chunk_id IN ({placeholders})", chunk_ids)
-                    rows = cursor.fetchall()
-                    conn.close()
+                    if AIOSQLITE_AVAILABLE:
+                        db = await self._get_db_pool()
+                        placeholders = ",".join("?" for _ in chunk_ids)
+                        cursor = await db.execute(
+                            f"SELECT * FROM wiki_entries WHERE chunk_id IN ({placeholders})",
+                            chunk_ids
+                        )
+                        rows = await cursor.fetchall()
+                    else:
+                        conn = sqlite3.connect(self.db_path)
+                        cursor = conn.cursor()
+                        placeholders = ",".join("?" for _ in chunk_ids)
+                        cursor.execute(f"SELECT * FROM wiki_entries WHERE chunk_id IN ({placeholders})", chunk_ids)
+                        rows = cursor.fetchall()
+                        conn.close()
                     
                     for row in rows:
                         results.append({
@@ -430,14 +560,22 @@ class VectorStore:
                 return results
 
         # SQLite Keyword fallback if Qdrant isn't working
-        conn = sqlite3.connect(self.db_path)
-        cursor = conn.cursor()
-        cursor.execute(
-            "SELECT * FROM wiki_entries WHERE entity_name = ? AND raw_content LIKE ? LIMIT ?",
-            (entity_name, f"%{query}%", limit)
-        )
-        rows = cursor.fetchall()
-        conn.close()
+        if AIOSQLITE_AVAILABLE:
+            db = await self._get_db_pool()
+            cursor = await db.execute(
+                "SELECT * FROM wiki_entries WHERE entity_name = ? AND raw_content LIKE ? LIMIT ?",
+                (entity_name, f"%{query}%", limit)
+            )
+            rows = await cursor.fetchall()
+        else:
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            cursor.execute(
+                "SELECT * FROM wiki_entries WHERE entity_name = ? AND raw_content LIKE ? LIMIT ?",
+                (entity_name, f"%{query}%", limit)
+            )
+            rows = cursor.fetchall()
+            conn.close()
         
         for row in rows:
             results.append({
@@ -477,6 +615,66 @@ class VectorStore:
                 self.supabase.table("missions").upsert(row).execute()
             except Exception as e:
                 logger.warning(f"Supabase mission mirror failed for {mission_id}: {e}")
+
+    def list_entities(self) -> List[Dict[str, Any]]:
+        """List all unique entities across wiki_entries and missions, with metadata.
+
+        Returns sorted list (most recent first) of:
+            {entity_name, mission_count, entry_count, last_mission_ts, last_upload_ts}
+        """
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        # Union of all entity names from both tables
+        cursor.execute("""
+            SELECT
+                COALESCE(w.entity_name, m.entity_name) AS entity_name,
+                COUNT(DISTINCT m.mission_id) AS mission_count,
+                COUNT(DISTINCT w.chunk_id) AS entry_count,
+                MAX(m.timestamp) AS last_mission_ts,
+                MAX(w.timestamp) AS last_upload_ts
+            FROM (
+                SELECT entity_name, chunk_id, timestamp FROM wiki_entries
+                UNION
+                SELECT entity_name, NULL, NULL FROM missions
+            ) AS all_entities
+            LEFT JOIN wiki_entries w ON all_entities.entity_name = w.entity_name
+            LEFT JOIN missions m ON all_entities.entity_name = m.entity_name
+            GROUP BY all_entities.entity_name
+            ORDER BY last_mission_ts DESC, entity_name ASC
+        """)
+        rows = cursor.fetchall()
+        conn.close()
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            results.append({
+                "entity_name": row[0],
+                "mission_count": row[1] or 0,
+                "entry_count": row[2] or 0,
+                "last_mission_ts": row[3],
+                "last_upload_ts": row[4],
+            })
+        return results
+
+    def list_missions_for_entity(self, entity_name: str, limit: int = 20) -> List[Dict[str, Any]]:
+        """List missions for a specific entity, most recent first."""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT * FROM missions WHERE entity_name = ? ORDER BY timestamp DESC LIMIT ?",
+            (entity_name, limit),
+        )
+        rows = cursor.fetchall()
+        conn.close()
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            results.append({
+                "mission_id": row[0],
+                "entity_name": row[1],
+                "status": row[2],
+                "report": row[3],
+                "timestamp": row[4],
+            })
+        return results
 
     def get_mission(self, mission_id: str) -> Optional[Dict[str, Any]]:
         """Retrieves a help mission by ID"""

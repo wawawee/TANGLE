@@ -1,0 +1,1 @@
+This image was flagged as containing VITAL information for helping '{entity}'. Analyze thoroughly. Extract all textual content verbatim, describe structural details, interpret charts/diagrams, and analyze implications.
