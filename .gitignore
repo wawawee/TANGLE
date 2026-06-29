@@ -52,6 +52,7 @@ backend/venv/
 .tangle-history/
 .tangle-kanban.json
 .tangle-plans/
+.tangle/vault/
 
 
 

@@ -893,7 +893,8 @@ async def admin_index():
 
 @app.post("/api/admin/export-wiki")
 async def admin_export_wiki():
-    """Rebuild the Obsidian-compatible wiki vault at docs/wiki/.
+    """Rebuild the Obsidian-compatible wiki vault at TANGLE_VAULT_ROOT
+    (default: .tangle/vault/, gitignored).
     Reads every entry from SQLite, writes per-chunk markdown files with
     YAML frontmatter, plus INDEX / TAGS / _meta and per-entity indexes.
 

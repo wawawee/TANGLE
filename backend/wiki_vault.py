@@ -1,12 +1,20 @@
 """TANGLE Wiki Vault — Obsidian-compatible markdown exporter.
 
 Reads the canonical wiki_entries from SQLite and writes a browsable vault
-to docs/wiki/. Designed so the user can open the directory in Obsidian
-(or any markdown editor) and navigate the knowledge graph via wikilinks.
+to .tangle/vault/ (or whatever TANGLE_VAULT_ROOT points to). Designed so
+the user can open the directory in Obsidian (or any markdown editor) and
+navigate the knowledge graph via wikilinks.
+
+The vault path is gitignored on purpose — wiki content is generated,
+not authored. If you want Obsidian to read it live, point Obsidian at
+the vault path (or symlink it). A previously-committed docs/wiki/ tree
+can stay as historical reference, but live exports go to the gitignored
+location so accidentally-leaked cross-project content can't end up in
+git by accident.
 
 Vault layout (created on first export, refreshed on every call):
 
-    docs/wiki/
+    <vault_root>/
     ├── _meta.md                     # vault metadata, last export time, counts
     ├── INDEX.md                     # master entity index (alphabetical)
     ├── TAGS.md                      # tag → chunk cross-reference
@@ -23,6 +31,8 @@ Each chunk file has:
 
 Toggle: set env TANGLE_WIKI_EXPORT_ON_MISSION=0 to disable auto-export
 on mission completion (manual /api/admin/export-wiki still works).
+
+Override default path: export TANGLE_VAULT_ROOT=/some/path/vault
 """
 
 from __future__ import annotations
@@ -39,7 +49,16 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger("tangle.wiki")
 
 # Vault lives at the repo root (parent of backend/), same convention as TASKLIST.md.
-DEFAULT_VAULT_ROOT = Path(__file__).parent.parent / "docs" / "wiki"
+# Path is gitignored by design — wiki content is generated, not authored, so it
+# shouldn't accidentally end up in version control. Override via TANGLE_VAULT_ROOT
+# if you want Obsidian to read it live (e.g. TANGLE_VAULT_ROOT=~/Documents/tangle-vault).
+def _resolve_default_vault_root() -> Path:
+    env_root = os.getenv("TANGLE_VAULT_ROOT")
+    if env_root:
+        return Path(env_root).expanduser().resolve()
+    return Path(__file__).parent.parent / ".tangle" / "vault"
+
+DEFAULT_VAULT_ROOT = _resolve_default_vault_root()
 DEFAULT_DB_PATH = Path(__file__).parent / "tangle.db"
 
 

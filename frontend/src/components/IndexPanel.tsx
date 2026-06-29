@@ -9,7 +9,7 @@
  *
  * Also exposes manual actions:
  *   - Refresh Index (re-fetch)
- *   - Export Wiki Vault (POST /api/admin/export-wiki → docs/wiki/)
+ *   - Export Wiki Vault (POST /api/admin/export-wiki → TANGLE_VAULT_ROOT, default .tangle/vault/)
  *   - Open Vault Folder (open in Finder)
  */
 
