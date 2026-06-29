@@ -36,7 +36,7 @@ dist/
 .checkpoint/
 
 # Archon
-.archon/runs/
+.archon/
 
 # Logs
 *.log
@@ -44,6 +44,15 @@ logs/
 
 # Browser use
 .browser_use/
+
+# Legacy agent-team / harness artifacts (kept on disk for reference, never commit)
+.claude/
+.review-harness/
+twisted-stacks-agentic-team/
+.sami-agent-prompt.md
+
+# Runtime uploads (file drop zone, not source)
+uploads/
 
 # TANGLE runtime artifacts (don't commit user data)
 backend/tangle.db
