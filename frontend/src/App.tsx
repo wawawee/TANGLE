@@ -26,6 +26,9 @@ import { CaseStatus } from './types/case';
 
 import { AdminDashboard } from './components/AdminDashboard';
 import { AgentChat } from './components/admin/AgentChat';
+import ContradictionGraph from './components/contradictions/ContradictionGraph';
+import { analyzeContradictions } from './services/api';
+import type { ContradictionResult } from './types/contradiction';
 
 const nodeTypes = {
   whoNode: WhoNode,
@@ -51,6 +54,11 @@ function FlowApp() {
   const [isHoveringSettings, setIsHoveringSettings] = useState(false);
   const [deepResearch, setDeepResearch] = useState(false);
   const [tokenUsage, setTokenUsage] = useState<Record<string, any>>({});
+  const [contradictionResult, setContradictionResult] = useState<ContradictionResult | null>(null);
+  const [contradictionLoading, setContradictionLoading] = useState(false);
+  const [contradictionError, setContradictionError] = useState<string | null>(null);
+  const [showContradictions, setShowContradictions] = useState(false);
+  const [lastEvidenceTexts, setLastEvidenceTexts] = useState<{ source: string; text: string }[]>([]);
   
   const {
     caseState,
@@ -167,6 +175,28 @@ function FlowApp() {
     setNodes((nds) => nds.map(n => n.id === dropNodeId ? { ...n, data: { ...n.data, wittyText } } : n));
   };
 
+  const runContradictionAnalysis = useCallback(async (evidenceTexts: { source: string; text: string }[]) => {
+    if (!evidenceTexts.length) return;
+    setContradictionLoading(true);
+    setContradictionError(null);
+    setShowContradictions(false);
+    try {
+      const result = await analyzeContradictions(evidenceTexts);
+      setContradictionResult(result as ContradictionResult);
+      if (result.contradictions?.length > 0) {
+        setShowContradictions(true);
+        addEventLog('SUCCESS', 'System', `Found ${result.contradictions.length} contradictions`);
+      } else {
+        addEventLog('INFO', 'System', 'No contradictions detected in evidence');
+      }
+    } catch (err: any) {
+      setContradictionError(err.message || 'Contradiction analysis failed');
+      addEventLog('ERROR', 'System', `Contradiction analysis: ${err.message}`);
+    } finally {
+      setContradictionLoading(false);
+    }
+  }, [addEventLog]);
+
   const handleAnalyze = (nodeId: string, evidence: any[]) => {
     setNodes((nds) => nds.map(n => n.id === nodeId ? { ...n, data: { ...n.data, submitted: true } } : n));
 
@@ -212,6 +242,13 @@ function FlowApp() {
     startMission(query, caseId).catch(() => {});
 
     connect(`ws://localhost:8000/ws/swarm/${caseId}`);
+
+    const evidenceTexts = evidence.map((e: any, i: number) => ({
+      source: e.filename || e.name || `evidence_${i + 1}`,
+      text: e.content || e.preview || '',
+    })).filter((e: { source: string; text: string }) => e.text.length > 20);
+    setLastEvidenceTexts(evidenceTexts);
+    runContradictionAnalysis(evidenceTexts);
   };
 
   const handleReset = () => {
@@ -227,6 +264,11 @@ function FlowApp() {
     ]);
     setEdges([]);
     setTokenUsage({});
+    setContradictionResult(null);
+    setContradictionLoading(false);
+    setContradictionError(null);
+    setShowContradictions(false);
+    setLastEvidenceTexts([]);
     setPendingAnalysis(null);
     setShowSidebar(false);
     setShowChat(false);
@@ -344,19 +386,54 @@ function FlowApp() {
           </Panel>
         )}
 
-        {/* Right panel: Strategy/Report */}
+        {/* Right panel: Strategy/Report + Contradictions */}
         {caseState.status !== CaseStatus.IDLE && (
-          <Panel position="top-right" className="w-[450px] max-h-[80vh] pointer-events-none mr-16">
+          <Panel position="top-right" className="w-[500px] max-h-[85vh] pointer-events-none mr-16">
             <div className="pointer-events-auto flex flex-col h-full min-h-[400px]">
-              <h3 className="font-bold uppercase mb-2 dark:text-[#eee] bg-white/80 dark:bg-black/80 backdrop-blur-sm inline-block px-2">Strategy</h3>
+              <div className="flex gap-0 mb-2">
+                <button
+                  onClick={() => setShowContradictions(false)}
+                  className={`font-bold uppercase px-3 py-1.5 text-xs transition-colors ${
+                    !showContradictions
+                      ? 'bg-[#111] text-white dark:bg-[#eee] dark:text-[#111]'
+                      : 'bg-white/80 dark:bg-black/80 text-[#111] dark:text-[#eee] hover:bg-gray-200 dark:hover:bg-gray-800'
+                  }`}
+                >
+                  Report
+                </button>
+                <button
+                  onClick={() => setShowContradictions(true)}
+                  className={`font-bold uppercase px-3 py-1.5 text-xs transition-colors ${
+                    showContradictions
+                      ? 'bg-[#111] text-white dark:bg-[#eee] dark:text-[#111]'
+                      : 'bg-white/80 dark:bg-black/80 text-[#111] dark:text-[#eee] hover:bg-gray-200 dark:hover:bg-gray-800'
+                  }`}
+                >
+                  Contradictions
+                  {(contradictionResult?.contradictions?.length ?? -1) >= 0 && (
+                    <span className="ml-1.5 text-[10px] opacity-70">
+                      ({contradictionResult?.contradictions?.length || 0})
+                    </span>
+                  )}
+                </button>
+              </div>
               <div className="flex-1 border-4 border-[#111] bg-white/90 backdrop-blur-md overflow-hidden dark:border-[#eee] dark:bg-[#0a0a0a]/90 shadow-[8px_8px_0px_0px_rgba(17,17,17,0.3)] dark:shadow-[8px_8px_0px_0px_rgba(238,238,238,0.3)]">
-                {caseState.status === CaseStatus.COMPLETE ? (
-                  <ReportViewer deliverables={caseState.deliverables} />
+                {!showContradictions ? (
+                  caseState.status === CaseStatus.COMPLETE ? (
+                    <ReportViewer deliverables={caseState.deliverables} />
+                  ) : (
+                    <div className="flex flex-col items-center justify-center h-full text-gray-800 dark:text-gray-400 p-6 text-center">
+                      <div className="w-12 h-12 border-4 border-[#111] border-t-transparent rounded-full animate-spin mb-4 dark:border-[#eee] dark:border-t-transparent" />
+                      <p className="font-mono text-sm uppercase">Awaiting Swarm Consensus...</p>
+                    </div>
+                  )
                 ) : (
-                  <div className="flex flex-col items-center justify-center h-full text-gray-800 dark:text-gray-400 p-6 text-center">
-                    <div className="w-12 h-12 border-4 border-[#111] border-t-transparent rounded-full animate-spin mb-4 dark:border-[#eee] dark:border-t-transparent" />
-                    <p className="font-mono text-sm uppercase">Awaiting Swarm Consensus...</p>
-                  </div>
+                  <ContradictionGraph
+                    result={contradictionResult}
+                    loading={contradictionLoading}
+                    error={contradictionError}
+                    onAnalyze={() => runContradictionAnalysis(lastEvidenceTexts)}
+                  />
                 )}
               </div>
             </div>

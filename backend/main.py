@@ -78,6 +78,7 @@ from kanban_store import KanbanBoard
 from run_history import RunHistory
 from wiki_vault import WikiVault
 import metrics as tangle_metrics
+from contradiction_engine import analyze_contradictions, format_contradiction_report
 
 gateway = FreeGateway()
 orchestrator = AgentOrchestrator(gateway)
@@ -1058,6 +1059,37 @@ async def swarm_websocket(ws: WebSocket, case_id: str):
         _swarm_connections[case_id] = [w for w in _swarm_connections.get(case_id, []) if w != ws]
         if not _swarm_connections[case_id]:
             _swarm_connections.pop(case_id, None)
+
+
+class ContradictionRequest(BaseModel):
+    evidence_texts: list[dict[str, str]] = []
+    entity: str = ""
+
+@app.post("/api/contradictions/analyze")
+async def analyze_case_contradictions(req: ContradictionRequest):
+    """Run contradiction detection on a set of evidence texts.
+
+    Each item in evidence_texts must have {source, text}.
+    Optionally provide an entity name for context.
+    """
+    if not _check_rate_limit("contradictions", max_requests=3, window=60.0):
+        raise HTTPException(status_code=429, detail="Rate limit: max 3 contradiction analyses per minute")
+
+    if not req.evidence_texts:
+        raise HTTPException(status_code=400, detail="No evidence texts provided")
+
+    try:
+        logger.info(
+            f"Contradiction analysis for {len(req.evidence_texts)} evidence items"
+            + (f" (entity={req.entity})" if req.entity else "")
+        )
+        result = await analyze_contradictions(gateway, req.evidence_texts)
+        result["evidence_count"] = len(req.evidence_texts)
+        result["entity"] = req.entity
+        return result
+    except Exception as e:
+        logger.error(f"Contradiction analysis failed: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/api/agent/witty")

@@ -197,3 +197,15 @@ export async function getWittyResponse(query: string) {
     body: JSON.stringify({ agent_id: 'orchestrator', task: query }),
   });
 }
+
+// ─── Contradiction Analysis ─────────────────────────
+
+export async function analyzeContradictions(
+  evidenceTexts: { source: string; text: string }[],
+  entity: string = ''
+) {
+  return apiFetch('/api/contradictions/analyze', {
+    method: 'POST',
+    body: JSON.stringify({ evidence_texts: evidenceTexts, entity }),
+  });
+}
