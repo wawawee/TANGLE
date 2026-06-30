@@ -23,6 +23,7 @@ sync_targets:
 ## 🚧 IN PROGRESS
 
 - [ ] **Phase 0 live verification** — user runs `python scripts/smoke_test.py` against a fresh venv; report any failures back here · owner: human · started: 2026-06-27
+- [ ] **Brutalist UI port from `finasteos/twisted/TWISTED-FRONTEND-NEW`** (started 2026-06-29) — Per confirmed UI on :3000 is "snyggaste UI jag sett någonsin". Replace TANGLE frontend (`src/App.tsx` + nodes + panels) with ported twisted-ref. Keep TANGLE backend (multi-provider routing, Qdrant, Supabase, parsing). Approach: copy `TWISTED-FRONTEND-NEW/{src,index.html,package.json,vite.config.ts,tsconfig.json}` → `TANGLE/frontend/`, drop `server.ts` (TANGLE Python backend replaces it), add Vite proxy `/api/*` → `:8000` and `/ws/*` → `:8000/ws/*`, map endpoints (WhoNode → /api/mission/start, DropNode → /api/upload, agent status via WS), replace twisted's 5 agent IDs with TANGLE's pipeline (planner/scout/librarian/critic/synthesizer). Accessibility-first by accident — works for Agda 86 + tech-savvy teenagers. Fix during port: remove chat bubble OR zoom buttons (currently overlap). Drop agent-config-editor for v1 (Phase 1+ candidate). ~4-6h focused work.
 
 ---
 
@@ -113,6 +114,10 @@ Each is a 2-4 hour architectural lift. Pick consciously.
 - 💡 **Mission replay** — re-watch a previous mission's telemetry event-by-event like a debugger
 - 💡 **Multi-file drop** — currently one file at a time. Drag a folder, ingest all.
 - 💡 **Auto-update TASKLIST from completed runs** — when a mission completes, mark items done via API
+- 💡 **Admin Mode overlay** (ported from `finasteos/twisted` admin panel, 2026-06-29) — HSL color sliders for live UI tweaking + markdown editor for agent system prompts + temperature per agent. Take only what adds value: SKIP vector memory panel (IndexPanel covers it), SKIP SwiftUI code (we're React), KEEP HSL sliders + agent prompt editor. Build when UI is "börjar nöjda" — Per's strategic view is React-first for design iteration, native (Swift/MacOS/iOS) port later once UI is frozen. ~3h lift.
+- 💡 **Brutalist design accents** (ported from `finasteos/twisted/TWISTED-FRONTEND-NEW` vite app, 2026-06-29) — hard `border-4` + offset `shadow-[8px_8px_0px]` skuggor + monospace. Per's "happy with the UI"-stil från förra projektet. Fuska in selektivt på admin mode + settings + knappar, INTE globalt. Krockar med dagens glassmorphism-tone så kräver varsamhet. ~2h för POC på en knapp.
+- 💡 **Token Usage panel** (ported from same vite app) — visar prompt/completion/total tokens per agent + swarm total, live via WebSocket. TANGLE saknar detta. Passar "kostnad är en feature" perfekt. ~1-2h.
+- 💡 **Admin Mode hotkey toggle** (ported from same) — hovra settings-ikonen + tryck `T` → togglar admin. ~30min.
 
 ---
 

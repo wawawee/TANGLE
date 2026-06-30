@@ -1,872 +1,496 @@
+import { useState, useCallback, useEffect } from 'react';
 import {
-    Background,
-    BackgroundVariant,
-    Controls,
-    MarkerType,
-    MiniMap,
-    ReactFlow,
-    ReactFlowProvider,
-    useEdgesState,
-    useNodesState,
-    useReactFlow,
-    type Edge,
-    type Node,
+  ReactFlow,
+  Background,
+  useNodesState,
+  useEdgesState,
+  addEdge,
+  BackgroundVariant,
+  useReactFlow,
+  ReactFlowProvider,
+  Panel
 } from '@xyflow/react';
+import type { Connection, Edge, Node } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
-import { useEffect, useRef, useState } from 'react';
+import { WhoNode } from './components/nodes/WhoNode';
+import { DropNode } from './components/nodes/DropNode';
+import { AgentNode } from './components/agentflow/AgentNode';
+import { Settings, Activity, Moon, Sun, Brain, Database, MessageCircle, RotateCcw } from 'lucide-react';
+import { getWittyResponse } from './services/gemini';
+import { startMission } from './services/api';
+import { useCaseState } from './hooks/useCaseState';
+import { useWebSocket } from './hooks/useWebSocket';
+import { EventLog } from './components/eventlog/EventLog';
+import { ReportViewer } from './components/report/ReportViewer';
+import { CaseStatus } from './types/case';
 
-// Width of the right-side panel (INDEX / CLI / LOGS). Kept here so all three
-// wrapper <div>s and the toggle width formula stay in sync.
-const SIDE_PANEL_WIDTH = 520;
-const LS_KEY = 'tangle-canvas-state';
-const STATIC_NODE_IDS = new Set(['orchestrator', 'qdrant', 'file-memory', 'agent-16']);
+import { AdminDashboard } from './components/AdminDashboard';
+import { AgentChat } from './components/admin/AgentChat';
 
-import AgentVerbosePanel from './components/AgentVerbosePanel';
-import ChatBox from './components/ChatBox';
-import CliHarness from './components/CliHarness';
-import EdgeTelemetry from './components/EdgeTelemetry';
-import EntitySelector from './components/EntitySelector';
-import ErrorBoundary from './components/ErrorBoundary';
-import Experience3D from './components/Experience3D';
-import IndexPanel from './components/IndexPanel';
-
-import MemoryNode from './nodes/MemoryNode';
-import type { PipelineNodeData } from './nodes/PipelineNode';
-import OrchestratorNode from './nodes/OrchestratorNode';
-import SystemGuardianNode from './nodes/SystemGuardianNode';
-import SourceNode from './nodes/SourceNode';
-import type { SourceNodeData } from './nodes/SourceNode';
-import EntityNode from './nodes/EntityNode';
-import type { EntityNodeData } from './nodes/EntityNode';
-import PipelineNode from './nodes/PipelineNode';
-
-import { useAgentStore } from './store/agentStore';
-
-// ─── Node Types ───────────────────────────────────────────────
-const NODE_TYPES = {
-  orchestrator: OrchestratorNode,
-  systemGuardian: SystemGuardianNode,
-  memory: MemoryNode,
-  source: SourceNode,
-  entity: EntityNode,
-  pipeline: PipelineNode,
+const nodeTypes = {
+  whoNode: WhoNode,
+  dropNode: DropNode,
+  agent: AgentNode
 };
 
-const EDGE_TYPES = {
-  telemetry: EdgeTelemetry,
-};
-
-// ─── Canvas Layout ─────────────────────────────────────────────
-const makeNodes = (): Node[] => {
-  const nodes: Node[] = [];
-
-  nodes.push({
-    id: 'orchestrator',
-    type: 'orchestrator',
-    position: { x: 400, y: 460 },
-    data: {},
-    draggable: true,
-  });
-
-  nodes.push({
-    id: 'qdrant',
-    type: 'memory',
-    position: { x: 80, y: 80 },
-    data: { nodeType: 'qdrant', label: 'Qdrant Cloud' },
-    draggable: true,
-  });
-
-  nodes.push({
-    id: 'file-memory',
-    type: 'memory',
-    position: { x: 80, y: 680 },
-    data: { nodeType: 'file', label: 'Markdown Files' },
-    draggable: true,
-  });
-
-  nodes.push({
-    id: 'agent-16',
-    type: 'systemGuardian',
-    position: { x: 1100, y: 460 },
-    data: {},
-    draggable: true,
-  });
-
-  return nodes;
-};
-
-const s = {
-  bar: {
-    display: 'flex', alignItems: 'center', gap: '16px',
-    padding: '12px 24px', flexShrink: 0,
-    position: 'relative' as const, zIndex: 60,
-    background: 'var(--glass-bg)',
-    backdropFilter: 'blur(16px) saturate(180%)',
-    WebkitBackdropFilter: 'blur(16px) saturate(180%)',
-    borderBottom: '1px solid var(--border)',
-  },
-  title: {
-    fontSize: '18px', fontWeight: 900, letterSpacing: '-0.05em',
-    color: 'var(--text)', lineHeight: '1', margin: 0,
-  },
-  subtitle: {
-    fontSize: '9px', fontWeight: 700, letterSpacing: '0.2em',
-    textTransform: 'uppercase' as const, color: 'var(--text-muted)', margin: '4px 0 0',
-  },
-  divider: {
-    width: '1px', height: '24px',
-    background: 'var(--border-bright)', margin: '0 16px',
-  },
-  terminalBtn: (active: boolean) => ({
-    padding: '8px 16px', borderRadius: '16px', border: '1px solid',
-    fontSize: '10px', fontWeight: 900, textTransform: 'uppercase' as const,
-    letterSpacing: '0.05em', cursor: 'pointer',
-    transition: 'all 0.2s', outline: 'none',
-    background: active ? '#10b98120' : 'var(--glass-bg)',
-    borderColor: active ? '#10b98160' : 'var(--border)',
-    color: active ? '#059669' : 'var(--text-dim)',
-  }),
-};
-
-function TangleCanvas() {
-  const [allNodes, setAllNodes] = useState(makeNodes());
-  const [allEdges, setAllEdges] = useState<Edge[]>([]);
-
-  const {
-    visibleNodes, visibleEdges, is3DMode, intensity, connectWs
-  } = useAgentStore();
-
-  const { screenToFlowPosition } = useReactFlow();
-
-  const [nodes, setNodes, _onNodesChange] = useNodesState<Node>([]);
+function FlowApp() {
+  const [nodes, setNodes, onNodesChange] = useNodesState<Node>([
+    {
+      id: 'who-1',
+      type: 'whoNode',
+      position: { x: window.innerWidth / 2 - 320, y: window.innerHeight / 2 - 200 },
+      data: { onSubmit: (id: string, value: string) => handleWhoSubmit(id, value), submitted: false }
+    }
+  ]);
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>([]);
-
-  const [showEntities, setShowEntities] = useState(false);
-  const [showTerminal, setShowTerminal] = useState(false);
-  const [showLogs, setShowLogs] = useState(false);
-  const [showIndex, setShowIndex] = useState(false);
-
-  // Sync dragged positions back to allNodes so localStorage saves them
-  const handleNodesChange = (changes: Parameters<typeof _onNodesChange>[0]) => {
-    _onNodesChange(changes);
-    setAllNodes(prev => {
-      let updated = prev;
-      for (const ch of changes) {
-        if (ch.type === 'position' && 'position' in ch && ch.position) {
-          updated = updated.map(n =>
-            n.id === ch.id ? { ...n, position: { ...n.position, ...ch.position } } : n
-          );
+  const [showSidebar, setShowSidebar] = useState(false);
+  const [sidebarTab, setSidebarTab] = useState<'settings'>('settings');
+  const [isDarkMode, setIsDarkMode] = useState(true);
+  const [isAdminMode, setIsAdminMode] = useState(false);
+  const [showChat, setShowChat] = useState(false);
+  const [isHoveringSettings, setIsHoveringSettings] = useState(false);
+  const [deepResearch, setDeepResearch] = useState(false);
+  const [tokenUsage, setTokenUsage] = useState<Record<string, any>>({});
+  
+  const {
+    caseState,
+    updateProgress,
+    addAgentThought,
+    addEventLog,
+    setDeliverables,
+    resetCase
+  } = useCaseState();
+  
+  const { connect, sendMessage, isConnected } = useWebSocket({
+    onProgress: updateProgress,
+    onAgentThought: addAgentThought,
+    onEventLog: addEventLog,
+    onTokenUsage: (usage) => {
+      setTokenUsage(prev => ({
+        ...prev,
+        [usage.agentId]: {
+          promptTokens: (prev[usage.agentId]?.promptTokens || 0) + usage.promptTokens,
+          completionTokens: (prev[usage.agentId]?.completionTokens || 0) + usage.completionTokens,
+          totalTokens: (prev[usage.agentId]?.totalTokens || 0) + usage.totalTokens,
         }
-      }
-      return updated;
-    });
-  };
-
-  // ─── Canvas drop & prompt state ────────────────────────────
-  const dragCounterRef = useRef(0);
-  const [isDragging, setIsDragging] = useState(false);
-  const [promptValue, setPromptValue] = useState('');
-  const [promptEntity, setPromptEntity] = useState('');
-  const [activeEntity, setActiveEntity] = useState<string | null>(null);
-  const [entityFilepaths, setEntityFilepaths] = useState<Record<string, string>>({});
-  const [isUploading, setIsUploading] = useState(false);
-  const [isMissionRunning, setIsMissionRunning] = useState(false);
-  const [missionEntity, setMissionEntity] = useState<string | null>(null);
-  const [currentMissionStep, setCurrentMissionStep] = useState<string>('');
-
-  // ─── localStorage persistence ─────────────────────────────
-  const initialLoadDone = useRef(false);
-  const saveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // Load persisted state on mount
-  useEffect(() => {
-    try {
-      const raw = localStorage.getItem(LS_KEY);
-      if (!raw) return;
-      const saved = JSON.parse(raw);
-      if (!saved || typeof saved !== 'object') return;
-
-      // Restore dynamic nodes (merge with static nodes from makeNodes)
-      if (Array.isArray(saved.nodes)) {
-        const staticNodes = makeNodes();
-        const restoredNodes: Node[] = saved.nodes
-          .filter((n: Node) => !STATIC_NODE_IDS.has(n.id))
-          .map((n: Node) => {
-            // Reset pipeline nodes stuck in active states
-            if (n.type === 'pipeline' && (n.data as PipelineNodeData)?.agentId) {
-              const agentId = (n.data as PipelineNodeData).agentId;
-              const storeStatus = useAgentStore.getState().agentStatuses[agentId];
-              if (storeStatus && storeStatus !== 'idle' && storeStatus !== 'done' && storeStatus !== 'error') {
-                useAgentStore.getState().setAgentStatus(agentId, 'idle');
-              }
-            }
-            // Reset entity nodes stuck in 'running'
-            if (n.type === 'entity' && (n.data as EntityNodeData)?.status === 'running') {
-              return { ...n, data: { ...n.data, status: 'idle' } as EntityNodeData };
-            }
-            return n;
-          });
-        setAllNodes([...staticNodes, ...restoredNodes]);
-      }
-
-      // Restore edges
-      if (Array.isArray(saved.edges)) {
-        setAllEdges(saved.edges as Edge[]);
-      }
-
-      // Restore entityFilepaths
-      if (saved.entityFilepaths && typeof saved.entityFilepaths === 'object') {
-        setEntityFilepaths(saved.entityFilepaths as Record<string, string>);
-      }
-    } catch {
-      // Corrupted localStorage — start fresh
-      localStorage.removeItem(LS_KEY);
-    }
-    initialLoadDone.current = true;
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // Save to localStorage (debounced) whenever dynamic state changes
-  useEffect(() => {
-    if (!initialLoadDone.current) return;
-
-    if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    saveTimerRef.current = setTimeout(() => {
-      try {
-        const dynamicNodes = allNodes.filter(n => !STATIC_NODE_IDS.has(n.id));
-        const data = {
-          nodes: dynamicNodes,
-          edges: allEdges,
-          entityFilepaths,
-        };
-        localStorage.setItem(LS_KEY, JSON.stringify(data));
-      } catch {
-        // localStorage full or unavailable — silently ignore
-      }
-    }, 400);
-
-    return () => {
-      if (saveTimerRef.current) clearTimeout(saveTimerRef.current);
-    };
-  }, [allNodes, allEdges, entityFilepaths]);
-
-  useEffect(() => {
-    const filteredNodes = allNodes.filter(n =>
-      visibleNodes.has(n.id) ||
-      n.id === 'orchestrator' ||
-      ['source', 'entity', 'pipeline'].includes(n.type!)
-    );
-    const filteredEdges = allEdges.filter(e => visibleEdges.has(e.id));
-    setNodes(filteredNodes);
-    setEdges(filteredEdges);
-  }, [visibleNodes, visibleEdges, allNodes, allEdges, setNodes, setEdges]);
-
-  // ─── Drag & drop handlers ──────────────────────────────────
-  const handleDragOver = (e: React.DragEvent) => {
-    e.preventDefault();
-    e.dataTransfer.dropEffect = 'copy';
-    dragCounterRef.current++;
-    setIsDragging(true);
-  };
-
-  const handleDragLeave = (e: React.DragEvent) => {
-    e.preventDefault();
-    dragCounterRef.current--;
-    if (dragCounterRef.current <= 0) {
-      dragCounterRef.current = 0;
-      setIsDragging(false);
-    }
-  };
-
-  const handleDrop = async (e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    const files = Array.from(e.dataTransfer.files);
-    if (files.length === 0) return;
-
-    const file = files[0];
-    const position = screenToFlowPosition({ x: e.clientX, y: e.clientY });
-    const entityName = file.name.replace(/\.[^/.]+$/, '');
-
-    // Optimistic SourceNode
-    const sourceId = `source-${Date.now()}`;
-    const optNode: Node<SourceNodeData> = {
-      id: sourceId,
-      type: 'source',
-      position,
-      data: {
-        filename: file.name,
-        filepath: '',
-        entity: entityName,
-        confidence: 0,
-        chunkId: sourceId,
-        timestamp: new Date().toISOString(),
-        tags: [],
-      },
-      draggable: true,
-    };
-    setAllNodes(prev => [...prev, optNode]);
-
-    // Auto-fill prompt
-    setPromptValue(entityName);
-    setPromptEntity(entityName);
-    setIsUploading(true);
-
-    try {
-      const formData = new FormData();
-      formData.append('file', file);
-      formData.append('entity', entityName);
-
-      const res = await fetch('http://localhost:8000/api/upload', {
-        method: 'POST',
-        body: formData,
-      });
-      if (!res.ok) throw new Error(`Upload failed: ${res.status}`);
-      const json = await res.json();
-
-      // Update SourceNode with real data
-      setAllNodes(prev => prev.map(n => {
-        if (n.id === sourceId) {
-          return {
-            ...n,
-            data: {
-              ...n.data,
-              filepath: json.filepath || '',
-              confidence: json.parsed?.confidence ?? 0.5,
-              chunkId: json.parsed?.chunk_id || sourceId,
-              timestamp: json.parsed?.timestamp || n.data.timestamp,
-              tags: json.parsed?.tags || [],
-              rawContent: json.parsed?.raw_content || '',
-              parseError: json.parsed?.parse_error || undefined,
-            } as SourceNodeData,
-          };
-        }
-        return n;
       }));
+    },
+    onComplete: setDeliverables,
+    onError: (err) => addEventLog('ERROR', 'System', err.message)
+  });
 
-      setEntityFilepaths(prev => ({ ...prev, [entityName.toLowerCase()]: json.filepath || '' }));
-    } catch (err) {
-      console.error('Upload error:', err);
-    } finally {
-      setIsUploading(false);
-    }
-
-    // If folder: upload all remaining files
-    if (files.length > 1) {
-      for (let i = 1; i < files.length; i++) {
-        const f = files[i];
-        const fEntity = f.name.replace(/\.[^/.]+$/, '');
-        const fPos = screenToFlowPosition({
-          x: e.clientX + i * 40,
-          y: e.clientY + i * 30,
-        });
-        const fId = `source-${Date.now()}-${i}`;
-        setAllNodes(prev => [...prev, {
-          id: fId,
-          type: 'source',
-          position: fPos,
-          data: {
-            filename: f.name,
-            filepath: '',
-            entity: fEntity,
-            confidence: 0,
-            chunkId: fId,
-            timestamp: new Date().toISOString(),
-            tags: [],
-          } as SourceNodeData,
-          draggable: true,
-        }]);
-
-        // Upload in background (don't block main flow)
-        const fFormData = new FormData();
-        fFormData.append('file', f);
-        fFormData.append('entity', fEntity);
-        fetch('http://localhost:8000/api/upload', { method: 'POST', body: fFormData })
-          .then(r => r.ok ? r.json() : null)
-          .then(json => {
-            if (!json) return;
-            setEntityFilepaths(prev => ({ ...prev, [fEntity.toLowerCase()]: json.filepath || '' }));
-            setAllNodes(prev => prev.map(n => {
-              if (n.id === fId) {
-                return {
-                  ...n,
-                  data: {
-                    ...n.data,
-                    filepath: json.filepath || '',
-                    confidence: json.parsed?.confidence ?? 0.5,
-                    chunkId: json.parsed?.chunk_id || fId,
-                    timestamp: json.parsed?.timestamp || (n.data as SourceNodeData).timestamp,
-                    tags: json.parsed?.tags || [],
-                    rawContent: json.parsed?.raw_content || '',
-                    parseError: json.parsed?.parse_error || undefined,
-                  } as SourceNodeData,
-                };
-              }
-              return n;
-            }));
-          })
-          .catch(err => console.error(`Upload error for ${f.name}:`, err));
+  useEffect(() => {
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key.toLowerCase() === 't' && isHoveringSettings) {
+        setIsAdminMode(prev => !prev);
       }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [isHoveringSettings]);
+
+  const [pendingAnalysis, setPendingAnalysis] = useState<any>(null);
+
+  useEffect(() => {
+    if (isConnected && pendingAnalysis) {
+      sendMessage('START_ANALYSIS', pendingAnalysis);
+      setPendingAnalysis(null);
     }
+  }, [isConnected, pendingAnalysis, sendMessage]);
+
+  useEffect(() => {
+    setNodes((nds) =>
+      nds.map((node) => {
+        if (node.type === 'agent') {
+          const agentData = caseState.agents.find(a => a.id === node.id);
+          if (agentData) {
+            return {
+              ...node,
+              data: {
+                ...node.data,
+                state: agentData.state,
+                confidence: agentData.confidence,
+                lastThought: agentData.lastThought,
+                isActive: caseState.currentAgent === node.id
+              }
+            };
+          }
+        }
+        return node;
+      })
+    );
+  }, [caseState.agents, caseState.currentAgent, setNodes]);
+
+  const { fitView } = useReactFlow();
+
+  useEffect(() => {
+    if (isDarkMode) {
+      document.body.classList.add('dark');
+      document.body.classList.remove('light');
+    } else {
+      document.body.classList.remove('dark');
+      document.body.classList.add('light');
+    }
+  }, [isDarkMode]);
+
+  const handleWhoSubmit = async (nodeId: string, value: string) => {
+    setNodes((nds) => nds.map(n => n.id === nodeId ? { ...n, data: { ...n.data, submitted: true } } : n));
+
+    const dropNodeId = `drop-${Date.now()}`;
+    const sourceNode = nodes.find(n => n.id === nodeId);
+    const newY = (sourceNode?.position.y || 0) + 300;
+    const newX = (sourceNode?.position.x || 0) + 128;
+
+    const newNode: Node = {
+      id: dropNodeId,
+      type: 'dropNode',
+      position: { x: newX, y: newY },
+      data: { 
+        wittyText: 'Thinking...',
+        onAnalyze: (id: string, evidence: any[]) => handleAnalyze(id, evidence)
+      }
+    };
+
+    setNodes((nds) => [...nds, newNode]);
+    setEdges((eds) => [...eds, {
+      id: `e-${nodeId}-${dropNodeId}`,
+      source: nodeId,
+      target: dropNodeId,
+      type: 'step',
+      animated: true,
+      style: { stroke: isDarkMode ? '#eee' : '#111', strokeWidth: 3 }
+    }]);
+
+    setTimeout(() => fitView({ padding: 0.2, duration: 800 }), 100);
+
+    const wittyText = await getWittyResponse(value);
+    setNodes((nds) => nds.map(n => n.id === dropNodeId ? { ...n, data: { ...n.data, wittyText } } : n));
   };
 
-  // ─── Mission start handler ─────────────────────────────────
-  const handleStartMission = async (entity: string, existingFilepath?: string) => {
-    const finalEntity = entity || promptEntity || 'Unknown Entity';
-    const filepath = existingFilepath || entityFilepaths[finalEntity.toLowerCase()] || undefined;
+  const handleAnalyze = (nodeId: string, evidence: any[]) => {
+    setNodes((nds) => nds.map(n => n.id === nodeId ? { ...n, data: { ...n.data, submitted: true } } : n));
 
-    setIsMissionRunning(true);
-    setMissionEntity(finalEntity);
-    setPromptEntity('');
-    setCurrentMissionStep('Starting mission…');
+    const sourceNode = nodes.find(n => n.id === nodeId);
+    const rightPanelWidth = 514;
+    const safeRightEdge = window.innerWidth - rightPanelWidth - 80;
 
-    // Update step based on pipeline agent statuses via polling (setInterval)
-    const stepNames: Record<string, string> = {
-      planner:     '🧠 Planning research strategy',
-      scout:       '🔍 Searching online sources',
-      librarian:   '📚 Querying internal knowledge',
-      critic:      '⚖️ Evaluating findings',
-      synthesizer: '✨ Synthesizing final report',
-    };
-    const stepPoll = setInterval(() => { // eslint-disable-line prefer-const
-      const statuses = useAgentStore.getState().agentStatuses;
-      for (const step of ['synthesizer', 'critic', 'librarian', 'scout', 'planner'] as const) {
-        const s = statuses[step];
-        if (s === 'thinking' || s === 'executing') {
-          setCurrentMissionStep(stepNames[step] || step);
-          return;
-        }
-      }
-      // All idle — mission probably done or not started
-      setCurrentMissionStep('Waiting for pipeline…');
-    }, 500);
+    const evidenceHeight = 200 + (evidence.length * 72);
+    const baseX = Math.min(sourceNode?.position.x || 0, safeRightEdge - 500);
+    const baseY = (sourceNode?.position.y || 0) + Math.max(400, evidenceHeight + 100);
+    const spread = Math.min(360, (safeRightEdge - baseX) / 2 - 40);
 
-    // Hook up WebSocket for live pipeline status
-    connectWs();
-
-    // Compute entity node ID early so we can wire edges to it
-    const entityId = `entity-${finalEntity.toLowerCase().replace(/\s+/g, '-')}`;
-
-    // Remove old pipeline nodes/edges, create fresh ones
-    const pipelineSteps = ['planner', 'scout', 'librarian', 'critic', 'synthesizer'] as const;
-    const pipeEdges = [
-      { id: 'pipe-ent-p',   source: entityId,  target: 'planner', animated: true },
-      { id: 'pipe-p-s',      source: 'planner', target: 'scout', animated: true },
-      { id: 'pipe-p-l',      source: 'planner', target: 'librarian', animated: true },
-      { id: 'pipe-s-c',      source: 'scout', target: 'critic', animated: true },
-      { id: 'pipe-l-c',      source: 'librarian', target: 'critic', animated: true },
-      { id: 'pipe-c-syn',    source: 'critic', target: 'synthesizer', animated: true },
-      { id: 'pipe-syn-orch', source: 'synthesizer', target: 'orchestrator', animated: true },
+    const newNodes: Node[] = [
+      { id: 'coordinator', type: 'agent', position: { x: baseX, y: baseY }, data: { name: 'Coordinator Alpha', role: 'orchestrator', state: 'active' } },
+      { id: 'context_weaver', type: 'agent', position: { x: baseX - spread, y: baseY + 220 }, data: { name: 'Context Weaver', role: 'analysis', state: 'idle' } },
+      { id: 'echo_vault', type: 'agent', position: { x: Math.min(baseX + spread, safeRightEdge - 280), y: baseY + 220 }, data: { name: 'Echo Vault', role: 'memory', state: 'idle' } },
+      { id: 'outcome_architect', type: 'agent', position: { x: baseX, y: baseY + 440 }, data: { name: 'Outcome Architect', role: 'strategy', state: 'idle' } },
+      { id: 'chronicle_scribe', type: 'agent', position: { x: baseX - spread + 60, y: baseY + 660 }, data: { name: 'Chronicle Scribe', role: 'documentation', state: 'idle' } },
+      { id: 'pulse_monitor', type: 'agent', position: { x: Math.min(baseX + spread - 60, safeRightEdge - 280), y: baseY + 660 }, data: { name: 'Pulse Monitor', role: 'telemetry', state: 'idle' } }
     ];
 
-    // Branch layout: Planner → Scout + Librarian (parallel) → Critic → Synthesizer
-    const pipePositions: Record<string, { x: number; y: number }> = {
-      planner:     { x: 80,  y: 340 },
-      scout:       { x: 280, y: 220 },
-      librarian:   { x: 280, y: 460 },
-      critic:      { x: 500, y: 340 },
-      synthesizer: { x: 720, y: 340 },
-    };
+    const strokeColor = isDarkMode ? '#eee' : '#111';
+    const newEdges: Edge[] = [
+      { id: `e-${nodeId}-coordinator`, source: nodeId, target: 'coordinator', type: 'step', animated: true, style: { stroke: strokeColor, strokeWidth: 3 } },
+      { id: 'e-c-cw', source: 'coordinator', target: 'context_weaver', type: 'step', animated: true, style: { stroke: strokeColor, strokeWidth: 2 } },
+      { id: 'e-c-ev', source: 'coordinator', target: 'echo_vault', type: 'step', animated: true, style: { stroke: strokeColor, strokeWidth: 2 } },
+      { id: 'e-cw-oa', source: 'context_weaver', target: 'outcome_architect', type: 'step', animated: true, style: { stroke: strokeColor, strokeWidth: 2 } },
+      { id: 'e-ev-oa', source: 'echo_vault', target: 'outcome_architect', type: 'step', animated: true, style: { stroke: strokeColor, strokeWidth: 2 } },
+      { id: 'e-oa-cs', source: 'outcome_architect', target: 'chronicle_scribe', type: 'step', animated: true, style: { stroke: strokeColor, strokeWidth: 2 } },
+      { id: 'e-oa-pm', source: 'outcome_architect', target: 'pulse_monitor', type: 'step', animated: true, style: { stroke: strokeColor, strokeWidth: 2 } },
+    ];
 
-    setAllNodes(prev => {
-      const cleaned = prev.filter(n => !pipelineSteps.includes(n.id as typeof pipelineSteps[number]));
-      const newNodes: Node<PipelineNodeData>[] = pipelineSteps.map(step => ({
-        id: step,
-        type: 'pipeline',
-        position: pipePositions[step],
-        data: {
-          agentId: step,
-          step,
-          label: step.charAt(0).toUpperCase() + step.slice(1),
-        },
-        draggable: true,
-      }));
-      return [...cleaned, ...newNodes];
-    });
+    setNodes(nds => [...nds, ...newNodes]);
+    setEdges(eds => [...eds, ...newEdges]);
 
-    setAllEdges(prev => {
-      const cleaned = prev.filter(e => !e.id.startsWith('pipe-'));
-      const newEdges: Edge[] = pipeEdges.map(pe => ({
-        id: pe.id,
-        source: pe.source,
-        target: pe.target,
-        type: 'telemetry',
-        animated: true,
-        style: { stroke: 'rgba(139,92,246,0.15)', strokeWidth: 1.5 },
-        markerEnd: { type: MarkerType.ArrowClosed, color: 'rgba(139,92,246,0.3)', width: 8, height: 8 },
-        data: { edgeId: pe.id, label: '', sourceId: pe.source, targetId: pe.target },
-      }));
-      return [...cleaned, ...newEdges];
-    });
+    setTimeout(() => fitView({ padding: 0.2, duration: 800 }), 100);
 
-    // Create/update EntityNode
-    const existingEntityIdx = allNodes.findIndex(n => n.id === entityId);
+    const query = evidence.map(e => e.content || e.preview).join('\n\n');
+    setPendingAnalysis({ query, deepResearch });
 
-    if (existingEntityIdx >= 0) {
-      setAllNodes(prev => prev.map(n => {
-        if (n.id === entityId) {
-          return {
-            ...n,
-            data: { ...n.data, status: 'running', filepath: filepath || (n.data as unknown as EntityNodeData).filepath } as EntityNodeData,
-          };
-        }
-        return n;
-      }));
-    } else {
-      const entityNode: Node<EntityNodeData> = {
-        id: entityId,
-        type: 'entity',
-        position: { x: 400, y: 180 },
-        data: { entity: finalEntity, status: 'running', filepath: filepath || undefined },
-        draggable: true,
-      };
-      setAllNodes(prev => [...prev, entityNode]);
-    }
+    const caseId = `case-${Date.now()}`;
 
-    try {
-      const body: Record<string, string> = { entity: finalEntity };
-      if (filepath) body.filepath = filepath;
+    startMission(query, caseId).catch(() => {});
 
-      const res = await fetch('http://localhost:8000/api/mission/start', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error(`Mission failed: ${res.status}`);
-      const json = await res.json();
-
-      setAllNodes(prev => prev.map(n => {
-        if (n.id === entityId) {
-          return {
-            ...n,
-            data: {
-              ...n.data,
-              status: 'done',
-              report: json.report,
-              reportMarkdown: json.report_markdown || json.report,
-              verified: json.verified,
-              criticScore: json.critic_score,
-            } as EntityNodeData,
-          };
-        }
-        return n;
-      }));
-    } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : String(err);
-      setAllNodes(prev => prev.map(n => {
-        if (n.id === entityId) {
-          return {
-            ...n,
-            data: {
-              ...n.data,
-              status: 'error',
-              errorMessage: msg,
-            } as EntityNodeData,
-          };
-        }
-        return n;
-      }));
-    } finally {
-      setIsMissionRunning(false);
-      setMissionEntity(null);
-      setPromptEntity('');
-    }
+    connect(`ws://localhost:8000/ws/swarm/${caseId}`);
   };
 
-  const handlePromptSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    const trimmed = promptValue.trim();
-    if (!trimmed) return;
-    handleStartMission(trimmed);
-    setPromptValue('');
+  const handleReset = () => {
+    const centerX = window.innerWidth / 2 - 320;
+    const centerY = window.innerHeight / 2 - 200;
+    setNodes([
+      {
+        id: `who-${Date.now()}`,
+        type: 'whoNode',
+        position: { x: centerX, y: centerY },
+        data: { onSubmit: (id: string, value: string) => handleWhoSubmit(id, value), submitted: false }
+      }
+    ]);
+    setEdges([]);
+    setTokenUsage({});
+    setPendingAnalysis(null);
+    setShowSidebar(false);
+    setShowChat(false);
+    setIsAdminMode(false);
+    resetCase();
+    setTimeout(() => fitView({ padding: 0.2, duration: 600 }), 50);
   };
+
+  const onConnect = useCallback(
+    (params: Connection | Edge) => setEdges((eds) => addEdge({ ...params, type: 'step', style: { stroke: isDarkMode ? '#eee' : '#111', strokeWidth: 3 } } as Edge, eds)),
+    [setEdges, isDarkMode],
+  );
 
   return (
-    <div style={{ width: '100vw', height: '100vh', display: 'flex', flexDirection: 'column', background: 'var(--void)' }}>
-      <Experience3D active={is3DMode} intensity={intensity} />
-      <ChatBox />
-
-      {/* Top bar */}
-      <div style={s.bar}>
-        <div style={{ display: 'flex', alignItems: 'center', gap: '12px' }}>
-          <div style={{ fontSize: '24px' }}>🦅</div>
-          <div>
-            <h1 style={s.title}>TANGLE</h1>
-            <p style={s.subtitle}>Untangle the world</p>
+    <div className="w-screen h-screen overflow-hidden relative transition-colors duration-300">
+      {/* Progress bar */}
+      {caseState.status !== CaseStatus.IDLE && (
+        <div className="absolute bottom-12 left-1/2 -translate-x-1/2 w-[600px] max-w-[90vw] z-50 pointer-events-none">
+          <div className="bg-white/60 dark:bg-black/60 backdrop-blur-md border-4 border-[#111] dark:border-[#eee] p-4 shadow-[8px_8px_0px_0px_rgba(17,17,17,0.3)] dark:shadow-[8px_8px_0px_0px_rgba(238,238,238,0.3)] flex flex-col space-y-2">
+            <div className="flex items-center justify-between">
+              <span className="text-sm font-black uppercase tracking-wider text-[#111] dark:text-[#eee] flex items-center space-x-2">
+                <Activity size={16} className="animate-pulse" />
+                <span>{caseState.stage}</span>
+              </span>
+              <span className="text-sm font-mono font-bold text-[#111] dark:text-[#eee]">{Math.round(caseState.progress)}%</span>
+            </div>
+            <div className="w-full h-4 border-2 border-[#111] dark:border-[#eee] bg-white/50 dark:bg-black/50 overflow-hidden">
+              <div 
+                className="h-full bg-[#111] dark:bg-[#eee] transition-all duration-500 ease-out" 
+                style={{ width: `${caseState.progress}%` }}
+              />
+            </div>
           </div>
         </div>
+      )}
 
-        <div style={s.divider} />
-
-        <div style={{ flex: 1 }} />
-
-        <div style={{ display: 'flex', gap: 6 }}>
-          <button
-            onClick={() => { setShowIndex(!showIndex); if (!showIndex) { setShowTerminal(false); setShowLogs(false); setShowEntities(false); } }}
-            style={{
-              ...s.terminalBtn(showIndex),
-              borderColor: showIndex ? '#a855f760' : 'var(--border)',
-              color: showIndex ? '#a855f7' : 'var(--text-dim)',
-            }}
-            title="Memory index — live snapshot of SQLite, Qdrant, Supabase, filesystem"
-          >
-            INDEX
-          </button>
-          <button
-            onClick={() => { setShowEntities(!showEntities); if (!showEntities) { setShowTerminal(false); setShowLogs(false); setShowIndex(false); } }}
-            style={{
-              ...s.terminalBtn(showEntities),
-              borderColor: showEntities ? '#c084fc60' : 'var(--border)',
-              color: showEntities ? '#c084fc' : 'var(--text-dim)',
-            }}
-            title="Entity browser — all entities with missions and files"
-          >
-            ENTITIES
-          </button>
-          <button
-            onClick={() => { setShowTerminal(!showTerminal); if (!showTerminal) { setShowLogs(false); setShowIndex(false); setShowEntities(false); } }}
-            style={s.terminalBtn(showTerminal)}
-          >
-            CLI
-          </button>
-          <button
-            onClick={() => { setShowLogs(!showLogs); if (!showLogs) { setShowTerminal(false); setShowIndex(false); setShowEntities(false); } }}
-            style={{
-              ...s.terminalBtn(showLogs),
-              borderColor: showLogs ? '#06b6d460' : 'var(--border)',
-              color: showLogs ? '#06b6d4' : 'var(--text-dim)',
-            }}
-          >
-            LOGS
-          </button>
-        </div>
-      </div>
-
-      {/* Main area */}
-      <div style={{ flex: 1, display: 'flex', overflow: 'hidden', position: 'relative' }}>
-        <div style={{ flex: 1, position: 'relative' }}>
-          <ReactFlow
-            nodes={nodes}
-            edges={edges}
-            onNodesChange={handleNodesChange}
-            onEdgesChange={onEdgesChange}
-            nodeTypes={NODE_TYPES}
-            edgeTypes={EDGE_TYPES}
-            colorMode="light"
-            fitView
-            fitViewOptions={{ padding: 0.5, duration: 800 }}
-            onDragOver={handleDragOver}
-            onDragLeave={handleDragLeave}
-            onDrop={handleDrop}
-          >
-            <Background variant={BackgroundVariant.Lines} gap={60} size={1} color="rgba(0,0,0,0.02)" />
-            <Controls />
-            <MiniMap />
-          </ReactFlow>
-
-          {/* ─── Drop Zone Overlay ──────────────────────────── */}
-          {isDragging && (
-            <div
-              style={{
-                position: 'absolute',
-                inset: 0,
-                zIndex: 100,
-                display: 'flex',
-                alignItems: 'center',
-                justifyContent: 'center',
-                background: 'rgba(139,92,246,0.08)',
-                backdropFilter: 'blur(4px)',
-                border: '2px dashed rgba(139,92,246,0.5)',
-                borderRadius: 16,
-                margin: 8,
-                pointerEvents: 'none',
-                transition: 'all 0.2s',
-              }}
-            >
-              <div style={{ textAlign: 'center' }}>
-                <div style={{ fontSize: 48, marginBottom: 12 }}>📂</div>
-                <div style={{
-                  fontSize: 18, fontWeight: 800,
-                  color: '#c084fc',
-                  letterSpacing: '-0.02em',
-                }}>
-                  Drop files here
-                </div>
-                <div style={{
-                  fontSize: 11, color: 'rgba(255,255,255,0.4)',
-                  marginTop: 6, fontFamily: 'JetBrains Mono, monospace',
-                }}>
-                  PDF · DOCX · XLSX · TXT · PNG · JPG
-                </div>
+      <ReactFlow
+        nodes={nodes}
+        edges={edges}
+        onNodesChange={onNodesChange}
+        onEdgesChange={onEdgesChange}
+        onConnect={onConnect}
+        nodeTypes={nodeTypes}
+        fitView
+        minZoom={0.1}
+        proOptions={{ hideAttribution: true }}
+        maxZoom={2}
+      >
+        <Background variant={BackgroundVariant.Dots} gap={24} size={2} color={isDarkMode ? "#333" : "#ccc"} />
+        
+        {/* Left panels: Event Log + Token Usage */}
+        {caseState.status !== CaseStatus.IDLE && (
+          <Panel position="top-left" className="w-[350px] max-h-[80vh] flex flex-col gap-4 pointer-events-none">
+            <div className="flex-1 pointer-events-auto flex flex-col min-h-[300px]">
+              <h3 className="font-bold uppercase mb-2 dark:text-[#eee] bg-white/80 dark:bg-black/80 backdrop-blur-sm inline-block px-2">Event Log</h3>
+              <div className="flex-1 border-4 border-[#111] bg-white/90 backdrop-blur-md dark:border-[#eee] dark:bg-[#0a0a0a]/90 shadow-[8px_8px_0px_0px_rgba(17,17,17,0.3)] dark:shadow-[8px_8px_0px_0px_rgba(238,238,238,0.3)]">
+                <EventLog 
+                  entries={caseState.eventLog}
+                  status={caseState.status}
+                  progress={caseState.progress}
+                  stage={caseState.stage}
+                />
               </div>
             </div>
-          )}
 
-          {/* ─── Floating Prompt ────────────────────────────── */}
-          <form
-            onSubmit={handlePromptSubmit}
-            style={{
-              position: 'absolute',
-              bottom: 32,
-              left: '50%',
-              transform: 'translateX(-50%)',
-              zIndex: 80,
-              display: 'flex',
-              alignItems: 'center',
-              gap: 8,
-              background: 'rgba(15,15,30,0.85)',
-              backdropFilter: 'blur(20px) saturate(180%)',
-              border: '1px solid rgba(255,255,255,0.1)',
-              borderRadius: 16,
-              padding: '6px 6px 6px 18px',
-              boxShadow: '0 8px 40px rgba(0,0,0,0.5), 0 0 0 1px rgba(139,92,246,0.1)',
-            }}
-          >
-            {promptEntity && !promptValue && (
-              <span style={{
-                fontSize: 11, fontWeight: 700,
-                color: '#c084fc',
-                background: 'rgba(139,92,246,0.12)',
-                padding: '3px 10px', borderRadius: 8,
-                border: '1px solid rgba(139,92,246,0.25)',
-              }}>
-                🎯 {promptEntity}
-              </span>
-            )}
-            <input
-              type="text"
-              value={promptValue}
-              onChange={(e) => setPromptValue(e.target.value)}
-              placeholder={
-                isUploading ? 'Uploading…' :
-                isMissionRunning ? currentMissionStep || `Helping ${missionEntity}…` :
-                'Help [entity]'
-              }
-              disabled={isUploading || isMissionRunning}
-              style={{
-                background: 'transparent',
-                border: 'none',
-                outline: 'none',
-                color: '#fff',
-                fontSize: 14,
-                fontWeight: 600,
-                fontFamily: 'JetBrains Mono, monospace',
-                width: 220,
-              }}
-            />
-            <button
-              type="submit"
-              disabled={isUploading || isMissionRunning || !promptValue.trim()}
-              style={{
-                padding: '8px 18px',
-                borderRadius: 12,
-                border: 'none',
-                background: promptValue.trim()
-                  ? 'linear-gradient(135deg, #8b5cf6, #06b6d4)'
-                  : 'rgba(255,255,255,0.06)',
-                color: promptValue.trim() ? '#fff' : 'rgba(255,255,255,0.3)',
-                fontSize: 12,
-                fontWeight: 700,
-                cursor: promptValue.trim() && !isUploading && !isMissionRunning ? 'pointer' : 'default',
-                transition: 'all 0.3s',
-                letterSpacing: '0.02em',
-              }}
-            >
-              {isUploading ? '⏳' : isMissionRunning ? '⚡' : '🚀'}
-            </button>
-          </form>
-
-          {/* Upload status indicator */}
-          {isUploading && (
-            <div style={{
-              position: 'absolute',
-              top: 20,
-              left: '50%',
-              transform: 'translateX(-50%)',
-              zIndex: 80,
-              display: 'flex',
-              alignItems: 'center',
-              gap: 8,
-              background: 'rgba(15,15,30,0.85)',
-              backdropFilter: 'blur(12px)',
-              border: '1px solid rgba(245,158,11,0.3)',
-              borderRadius: 10,
-              padding: '8px 20px',
-            }}>
-              <div style={{
-                width: 6, height: 6, borderRadius: '50%',
-                background: '#f59e0b',
-                animation: 'pulse-glow 1s ease-in-out infinite',
-              }} />
-              <span style={{
-                fontSize: 11, fontWeight: 700,
-                color: '#f59e0b',
-                fontFamily: 'JetBrains Mono, monospace',
-              }}>
-                Uploading file…
-              </span>
+            <div className="flex-1 pointer-events-auto flex flex-col min-h-[250px]">
+              <h3 className="font-bold uppercase mb-2 dark:text-[#eee] bg-white/80 dark:bg-black/80 backdrop-blur-sm inline-block px-2">Token Usage</h3>
+              <div className="flex-1 border-4 border-[#111] bg-white/90 backdrop-blur-md dark:border-[#eee] dark:bg-[#0a0a0a]/90 p-4 overflow-y-auto shadow-[8px_8px_0px_0px_rgba(17,17,17,0.3)] dark:shadow-[8px_8px_0px_0px_rgba(238,238,238,0.3)]">
+                {Object.keys(tokenUsage).length === 0 ? (
+                  <div className="flex items-center justify-center h-full text-gray-500 font-mono text-sm uppercase">
+                    No usage data yet
+                  </div>
+                ) : (
+                  <div className="space-y-4">
+                    {Object.entries(tokenUsage).map(([agentId, usage]) => (
+                      <div key={agentId} className="border-b-2 border-gray-200 dark:border-gray-800 pb-2">
+                        <div className="font-bold text-sm uppercase mb-1 dark:text-[#eee]">{agentId}</div>
+                        <div className="grid grid-cols-3 gap-2 text-xs font-mono">
+                          <div className="flex flex-col">
+                            <span className="text-gray-500">Prompt</span>
+                            <span className="dark:text-[#eee]">{usage.promptTokens.toLocaleString()}</span>
+                          </div>
+                          <div className="flex flex-col">
+                            <span className="text-gray-500">Completion</span>
+                            <span className="dark:text-[#eee]">{usage.completionTokens.toLocaleString()}</span>
+                          </div>
+                          <div className="flex flex-col">
+                            <span className="text-gray-500">Total</span>
+                            <span className="font-bold dark:text-[#eee]">{usage.totalTokens.toLocaleString()}</span>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                    <div className="pt-2 mt-2 border-t-4 border-[#111] dark:border-[#eee]">
+                      <div className="font-black text-sm uppercase mb-1 dark:text-[#eee]">Total Swarm Usage</div>
+                      <div className="grid grid-cols-3 gap-2 text-xs font-mono">
+                        <div className="flex flex-col">
+                          <span className="text-gray-500">Prompt</span>
+                          <span className="dark:text-[#eee]">{Object.values(tokenUsage).reduce((acc: number, curr: any) => acc + curr.promptTokens, 0).toLocaleString()}</span>
+                        </div>
+                        <div className="flex flex-col">
+                          <span className="text-gray-500">Completion</span>
+                          <span className="dark:text-[#eee]">{Object.values(tokenUsage).reduce((acc: number, curr: any) => acc + curr.completionTokens, 0).toLocaleString()}</span>
+                        </div>
+                        <div className="flex flex-col">
+                          <span className="text-gray-500">Total</span>
+                          <span className="font-bold dark:text-[#eee]">{Object.values(tokenUsage).reduce((acc: number, curr: any) => acc + curr.totalTokens, 0).toLocaleString()}</span>
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
             </div>
-          )}
+          </Panel>
+        )}
+
+        {/* Right panel: Strategy/Report */}
+        {caseState.status !== CaseStatus.IDLE && (
+          <Panel position="top-right" className="w-[450px] max-h-[80vh] pointer-events-none mr-16">
+            <div className="pointer-events-auto flex flex-col h-full min-h-[400px]">
+              <h3 className="font-bold uppercase mb-2 dark:text-[#eee] bg-white/80 dark:bg-black/80 backdrop-blur-sm inline-block px-2">Strategy</h3>
+              <div className="flex-1 border-4 border-[#111] bg-white/90 backdrop-blur-md overflow-hidden dark:border-[#eee] dark:bg-[#0a0a0a]/90 shadow-[8px_8px_0px_0px_rgba(17,17,17,0.3)] dark:shadow-[8px_8px_0px_0px_rgba(238,238,238,0.3)]">
+                {caseState.status === CaseStatus.COMPLETE ? (
+                  <ReportViewer deliverables={caseState.deliverables} />
+                ) : (
+                  <div className="flex flex-col items-center justify-center h-full text-gray-800 dark:text-gray-400 p-6 text-center">
+                    <div className="w-12 h-12 border-4 border-[#111] border-t-transparent rounded-full animate-spin mb-4 dark:border-[#eee] dark:border-t-transparent" />
+                    <p className="font-mono text-sm uppercase">Awaiting Swarm Consensus...</p>
+                  </div>
+                )}
+              </div>
+            </div>
+          </Panel>
+        )}
+      </ReactFlow>
+
+      {/* Top-right action buttons */}
+      <div className="absolute top-6 right-6 flex items-center space-x-4 z-50">
+        <button
+          onClick={handleReset}
+          className="p-3 bg-white border-4 border-[#111] shadow-[4px_4px_0px_0px_#111] hover:translate-y-[2px] hover:translate-x-[2px] hover:shadow-[2px_2px_0px_0px_#111] transition-all dark:bg-[#0a0a0a] dark:border-[#eee] dark:shadow-[4px_4px_0px_0px_#eee] dark:hover:shadow-[2px_2px_0px_0px_#eee] group relative"
+          title="New Case"
+        >
+          <RotateCcw size={22} strokeWidth={2.5} className="dark:text-[#eee]" />
+          <span className="absolute -bottom-8 left-1/2 -translate-x-1/2 text-xs font-bold whitespace-nowrap bg-white border-2 border-[#111] px-2 py-0.5 opacity-0 group-hover:opacity-100 transition-opacity dark:bg-[#0a0a0a] dark:border-[#eee] dark:text-[#eee]">
+            NEW CASE
+          </span>
+        </button>
+
+        <button 
+          onClick={() => setShowSidebar(!showSidebar)}
+          onMouseEnter={() => setIsHoveringSettings(true)}
+          onMouseLeave={() => setIsHoveringSettings(false)}
+          className="p-3 bg-white border-4 border-[#111] shadow-[4px_4px_0px_0px_#111] hover:translate-y-[2px] hover:translate-x-[2px] hover:shadow-[2px_2px_0px_0px_#111] transition-all dark:bg-[#0a0a0a] dark:border-[#eee] dark:shadow-[4px_4px_0px_0px_#eee] dark:hover:shadow-[2px_2px_0px_0px_#eee]"
+        >
+          <Settings size={28} strokeWidth={2.5} className="dark:text-[#eee]" />
+        </button>
+      </div>
+
+      {/* Settings sidebar */}
+      <div 
+        className={`absolute top-0 right-0 w-1/3 min-w-[450px] h-full bg-white/90 backdrop-blur-3xl border-l-4 border-[#111] shadow-[-12px_0px_0px_0px_rgba(0,0,0,0.05)] transition-transform duration-500 z-40 dark:bg-[#0a0a0a]/90 dark:border-[#eee] flex flex-col ${showSidebar ? 'translate-x-0' : 'translate-x-full'}`}
+      >
+        <div className="flex border-b-4 border-[#111] dark:border-[#eee] mt-24">
+          <button 
+            onClick={() => setSidebarTab('settings')}
+            className={`flex-1 py-4 font-black uppercase flex items-center justify-center space-x-2 transition-colors ${sidebarTab === 'settings' ? 'bg-[#111] text-white dark:bg-[#eee] dark:text-[#111]' : 'hover:bg-gray-100 dark:hover:bg-gray-800 dark:text-[#eee]'}`}
+          >
+            <Settings size={20} />
+            <span>Settings</span>
+          </button>
         </div>
 
-        {/* Side panel */}
-        <div
-          style={{
-            borderLeft: '1px solid var(--border)',
-            background: 'var(--surface)',
-            transition: 'width 0.3s',
-            overflow: 'hidden',
-            flexShrink: 0,
-            width: showTerminal || showLogs || showIndex || showEntities ? SIDE_PANEL_WIDTH : 0,
-          }}
-        >
-          {showIndex && (
-            <div style={{ width: SIDE_PANEL_WIDTH, height: '100%', overflow: 'hidden' }}>
-              <ErrorBoundary>
-                <IndexPanel />
-              </ErrorBoundary>
+        <div className="flex-1 overflow-y-auto p-8">
+          <div className="space-y-8 dark:text-[#eee]">
+              <div className="brutalist-card p-6">
+                <h3 className="font-black uppercase text-xl mb-4 border-b-2 border-[#111] dark:border-[#eee] pb-2 text-black dark:text-white">User Settings</h3>
+                
+                <div className="flex items-center justify-between mb-6">
+                  <span className="font-mono font-bold text-black dark:text-white">Dark Mode</span>
+                  <button 
+                    onClick={() => setIsDarkMode(!isDarkMode)}
+                    className="w-16 h-8 border-2 border-[#111] dark:border-[#eee] rounded-full relative bg-[#f4f4f0] dark:bg-[#111] transition-colors"
+                  >
+                    <div className={`absolute top-0.5 w-6 h-6 rounded-full border-2 border-[#111] dark:border-[#eee] flex items-center justify-center transition-transform ${isDarkMode ? 'translate-x-8 bg-[#eee]' : 'translate-x-0.5 bg-[#111]'}`}>
+                      {isDarkMode ? <Moon size={12} className="text-[#111]" /> : <Sun size={12} className="text-[#fff]" />}
+                    </div>
+                  </button>
+                </div>
+
+                <div className="flex items-center justify-between mb-6">
+                  <div className="flex flex-col pr-4">
+                    <span className="font-mono font-bold flex items-center space-x-2 text-black dark:text-white">
+                      <Brain size={16} />
+                      <span>Deep Research</span>
+                    </span>
+                    <span className="text-xs text-gray-800 dark:text-gray-400 mt-1">
+                      Uses extended analysis with OpenRouter models. Will take significantly longer.
+                    </span>
+                  </div>
+                  <button 
+                    onClick={() => setDeepResearch(!deepResearch)}
+                    className="w-16 h-8 border-2 border-[#111] dark:border-[#eee] rounded-full relative bg-[#f4f4f0] dark:bg-[#111] transition-colors shrink-0"
+                  >
+                    <div className={`absolute top-0.5 w-6 h-6 rounded-full border-2 border-[#111] dark:border-[#eee] transition-transform ${deepResearch ? 'translate-x-8 bg-[#00ff88]' : 'translate-x-0.5 bg-gray-400'}`} />
+                  </button>
+                </div>
+
+                <div className="flex items-center justify-between pt-6 border-t-2 border-[#111] dark:border-[#eee]">
+                  <div className="flex flex-col pr-4">
+                    <span className="font-mono font-bold flex items-center space-x-2 text-[#ff003c]">
+                      <Database size={16} />
+                      <span>Admin Mode</span>
+                    </span>
+                    <span className="text-xs text-gray-800 dark:text-gray-400 mt-1">
+                      Unlock advanced configuration, memory management, and model settings.
+                    </span>
+                  </div>
+                  <button 
+                    onClick={() => setIsAdminMode(!isAdminMode)}
+                    className="w-16 h-8 border-2 border-[#111] dark:border-[#eee] rounded-full relative bg-[#f4f4f0] dark:bg-[#111] transition-colors shrink-0"
+                  >
+                    <div className={`absolute top-0.5 w-6 h-6 rounded-full border-2 border-[#111] dark:border-[#eee] transition-transform ${isAdminMode ? 'translate-x-8 bg-[#ff003c]' : 'translate-x-0.5 bg-gray-400'}`} />
+                  </button>
+                </div>
+              </div>
+
+              <div className="brutalist-card p-6 border-[#ff003c] dark:border-[#ff003c]">
+                <h3 className="font-black uppercase text-xl mb-4 border-b-2 border-[#111] dark:border-[#eee] pb-2 flex items-center space-x-2 text-black dark:text-white">
+                  <Database size={20} />
+                  <span>Admin Dashboard</span>
+                </h3>
+                <p className="text-xs font-mono mb-4 text-gray-800 dark:text-gray-400">
+                  Access advanced configuration, memory management, token telemetry, and API keys.
+                  <br /><br />
+                  <span className="text-[#ff003c] font-bold">Shortcut:</span> Hover over the settings icon and press 'T'.
+                </p>
+                <button 
+                  onClick={() => setIsAdminMode(true)}
+                  className="w-full py-3 bg-[#ff003c] text-white font-black uppercase tracking-widest hover:bg-black transition-colors"
+                >
+                  Launch Admin Mode
+                </button>
+              </div>
             </div>
-          )}
-          {showTerminal && (
-            <div style={{ width: SIDE_PANEL_WIDTH, height: '100%', overflow: 'hidden' }}>
-              <ErrorBoundary>
-                <CliHarness />
-              </ErrorBoundary>
-            </div>
-          )}
-          {showEntities && (
-            <div style={{ width: SIDE_PANEL_WIDTH, height: '100%', overflow: 'hidden' }}>
-              <ErrorBoundary>
-                <EntitySelector
-                  activeEntity={activeEntity}
-                  onSelectEntity={(name) => {
-                    setActiveEntity(name);
-                    setPromptValue(name);
-                    setPromptEntity(name);
-                    // Ensure entity node exists on canvas
-                    const eid = `entity-${name.toLowerCase().replace(/\s+/g, '-')}`;
-                    setAllNodes(prev => prev.some(n => n.id === eid) ? prev : [...prev, {
-                      id: eid,
-                      type: 'entity',
-                      position: { x: 300 + Math.random() * 200, y: 100 + Math.random() * 200 },
-                      data: { entity: name, status: 'idle' },
-                      draggable: true,
-                    } as Node<EntityNodeData>]);
-                  }}
-                  onStartMission={(name) => handleStartMission(name)}
-                />
-              </ErrorBoundary>
-            </div>
-          )}
-          {showLogs && (
-            <div style={{ width: SIDE_PANEL_WIDTH, height: '100%', overflow: 'hidden' }}>
-              <ErrorBoundary>
-                <AgentVerbosePanel />
-              </ErrorBoundary>
-            </div>
-          )}
         </div>
       </div>
+
+      {isAdminMode && (
+        <AdminDashboard onClose={() => setIsAdminMode(false)} />
+      )}
+
+      {/* Floating Agent Chat Button */}
+      <button
+        onClick={() => setShowChat(!showChat)}
+        className="fixed bottom-6 left-6 z-50 w-14 h-14 rounded-full bg-gradient-to-br from-[#7B68EE] to-[#00D4FF] text-white shadow-lg hover:shadow-xl hover:scale-110 transition-all flex items-center justify-center"
+        style={{ boxShadow: '0 4px 20px rgba(123, 104, 238, 0.4)' }}
+        title="Chat with Agents"
+      >
+        <MessageCircle size={24} />
+      </button>
+
+      <AgentChat isOpen={showChat} onClose={() => setShowChat(false)} />
     </div>
   );
 }
@@ -874,7 +498,7 @@ function TangleCanvas() {
 export default function App() {
   return (
     <ReactFlowProvider>
-      <TangleCanvas />
+      <FlowApp />
     </ReactFlowProvider>
   );
 }

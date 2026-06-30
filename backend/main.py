@@ -912,6 +912,211 @@ async def admin_export_wiki_preview():
     Useful for sanity-checking before triggering a full rebuild."""
     return wiki_vault.preview_export()
 
+# ─────────────────────────────────────────────────────────────
+# DROPHELP Swarm Endpoints (TWISTED-FRONTEND-NEW migration)
+# ─────────────────────────────────────────────────────────────
+
+# In-memory knowledge docs store
+_knowledge_docs: list[dict] = [
+    {"id": "1", "title": "Swedish Contract Law", "content": "Key principles of Swedish contract law including AvtL 36 §.", "source": "system"},
+    {"id": "2", "title": "GDPR Guidelines", "content": "EU General Data Protection Regulation compliance for case evidence.", "source": "system"},
+]
+
+_swarm_connections: dict[str, list[WebSocket]] = {}
+
+SWARM_SYSTEM_PROMPT = """You are an AI agent in a swarm intelligence system called DROPHELP (previously known as TWISTED).
+Your role is to analyze case evidence and provide strategic insights.
+Be concise, direct, and actionable. Output structured analysis with clear headings.
+Each sub-agent has a different specialty — stay in your lane."""
+
+async def _broadcast_swarm(case_id: str, event: dict):
+    """Broadcast a swarm event to all WebSocket connections for a case."""
+    for ws in _swarm_connections.get(case_id, []):
+        try:
+            await ws.send_json(event)
+        except Exception:
+            pass
+
+async def _run_swarm_agents(case_id: str, query: str, deep_research: bool = False):
+    """Run the multi-agent swarm analysis pipeline, broadcasting events via WebSocket."""
+    agents = [
+        {"id": "context_weaver", "name": "Context Weaver", "system_prompt": f"{SWARM_SYSTEM_PROMPT}\n\nYou are the Context Weaver, a legal analysis specialist. Analyze the provided evidence and extract key facts, legal principles, and contextual information."},
+        {"id": "echo_vault", "name": "Echo Vault", "system_prompt": f"{SWARM_SYSTEM_PROMPT}\n\nYou are the Echo Vault, a memory and precedent specialist. Identify relevant precedents, patterns, and connections in the evidence."},
+        {"id": "outcome_architect", "name": "Outcome Architect", "system_prompt": f"{SWARM_SYSTEM_PROMPT}\n\nYou are the Outcome Architect, a strategy specialist. Synthesize the analysis into actionable recommendations and predicted outcomes."},
+        {"id": "chronicle_scribe", "name": "Chronicle Scribe", "system_prompt": f"{SWARM_SYSTEM_PROMPT}\n\nYou are the Chronicle Scribe, a documentation specialist. Produce a comprehensive, well-structured report with findings, analysis, and recommendations."},
+        {"id": "pulse_monitor", "name": "Pulse Monitor", "system_prompt": f"{SWARM_SYSTEM_PROMPT}\n\nYou are the Pulse Monitor, a risk and quality specialist. Review the final output for completeness, flag risks, and suggest verification steps."},
+    ]
+
+    async def _run_single_agent(agent: dict, prev_output: str = "") -> str:
+        agent_id = agent["id"]
+        await _broadcast_swarm(case_id, {
+            "type": "agent_state", "agentId": agent_id,
+            "state": "querying", "confidence": 0.3,
+            "thought": f"Starting analysis...",
+            "progress": 0, "stage": agent["name"]
+        })
+        await _broadcast_swarm(case_id, {
+            "type": "event_log", "entry": {
+                "timestamp": datetime.utcnow().isoformat(),
+                "level": "THINK", "agent": agent["name"],
+                "message": f"Beginning {agent['name']} analysis phase..."
+            }
+        })
+
+        messages = [
+            {"role": "system", "content": agent["system_prompt"]},
+            {"role": "user", "content": f"Evidence:\n{query}\n\nPrevious analysis:\n{prev_output}\n\nPlease provide your analysis."}
+        ]
+
+        result = await gateway.chat("openrouter/meta-llama/llama-3.3-70b-instruct:free", messages)
+        content = result.get("content", "No analysis generated.")
+        tokens = result.get("usage", {})
+
+        await _broadcast_swarm(case_id, {
+            "type": "token_usage", "agentId": agent_id,
+            "promptTokens": tokens.get("prompt_tokens", 0),
+            "completionTokens": tokens.get("completion_tokens", 0),
+            "totalTokens": tokens.get("total_tokens", 0),
+        })
+        await _broadcast_swarm(case_id, {
+            "type": "agent_state", "agentId": agent_id,
+            "state": "complete", "confidence": 0.9,
+            "thought": f"{agent['name']} analysis complete.",
+            "progress": 100, "stage": agent["name"]
+        })
+        await _broadcast_swarm(case_id, {
+            "type": "event_log", "entry": {
+                "timestamp": datetime.utcnow().isoformat(),
+                "level": "SUCCESS", "agent": agent["name"],
+                "message": f"{agent['name']} phase completed successfully."
+            }
+        })
+        return content
+
+    await _broadcast_swarm(case_id, {"type": "progress", "progress": 5, "stage": "Initializing Swarm..."})
+    await _broadcast_swarm(case_id, {"type": "event_log", "entry": {
+        "timestamp": datetime.utcnow().isoformat(),
+        "level": "INFO", "agent": "System",
+        "message": f"Swarm initialized with {len(agents)} agents. Deep research: {deep_research}."
+    }})
+
+    await _broadcast_swarm(case_id, {"type": "progress", "progress": 15, "stage": "Context Analysis..."})
+    cw_result = await _run_single_agent(agents[0])
+
+    await _broadcast_swarm(case_id, {"type": "progress", "progress": 30, "stage": "Memory & Precedent Analysis..."})
+    ev_result = await _run_single_agent(agents[1], cw_result)
+
+    await _broadcast_swarm(case_id, {"type": "progress", "progress": 50, "stage": "Strategic Synthesis..."})
+    oa_result = await _run_single_agent(agents[2], f"Context: {cw_result}\n\nPrecedents: {ev_result}")
+
+    await _broadcast_swarm(case_id, {"type": "progress", "progress": 70, "stage": "Report Generation..."})
+    cs_result = await _run_single_agent(agents[3], oa_result)
+
+    await _broadcast_swarm(case_id, {"type": "progress", "progress": 90, "stage": "Quality Review..."})
+    pm_result = await _run_single_agent(agents[4], cs_result)
+
+    deliverables = {
+        "strategy": oa_result,
+        "report": cs_result,
+        "quality": pm_result,
+        "context_analysis": cw_result,
+        "memory_analysis": ev_result,
+    }
+
+    await _broadcast_swarm(case_id, {"type": "progress", "progress": 100, "stage": "Complete"})
+    await _broadcast_swarm(case_id, {"type": "event_log", "entry": {
+        "timestamp": datetime.utcnow().isoformat(),
+        "level": "SUCCESS", "agent": "System",
+        "message": "Swarm analysis complete. All agents have reported."
+    }})
+    await _broadcast_swarm(case_id, {"type": "complete", "deliverables": deliverables})
+
+
+@app.websocket("/ws/swarm/{case_id}")
+async def swarm_websocket(ws: WebSocket, case_id: str):
+    await ws.accept()
+    if case_id not in _swarm_connections:
+        _swarm_connections[case_id] = []
+    _swarm_connections[case_id].append(ws)
+    try:
+        data = await ws.receive_text()
+        msg = json.loads(data)
+        if msg.get("action") == "START_ANALYSIS":
+            query = msg.get("query", "")
+            deep_research = msg.get("deepResearch", False)
+            await _broadcast_swarm(case_id, {"type": "event_log", "entry": {
+                "timestamp": datetime.utcnow().isoformat(),
+                "level": "INFO", "agent": "System",
+                "message": f"Analysis started. Query length: {len(query)} chars. Deep research: {deep_research}."
+            }})
+            await _run_swarm_agents(case_id, query, deep_research)
+    except WebSocketDisconnect:
+        pass
+    except json.JSONDecodeError:
+        pass
+    finally:
+        _swarm_connections[case_id] = [w for w in _swarm_connections.get(case_id, []) if w != ws]
+        if not _swarm_connections[case_id]:
+            _swarm_connections.pop(case_id, None)
+
+
+@app.post("/api/agent/witty")
+async def witty_response(req: AgentTask):
+    """Generate a witty response using FreeGateway (OpenRouter)."""
+    messages = [
+        {"role": "system", "content": "You are a witty, creative AI assistant. Respond with clever, engaging commentary."},
+        {"role": "user", "content": req.task}
+    ]
+    result = await gateway.chat("openrouter/meta-llama/llama-3.3-70b-instruct:free", messages)
+    if "error" in result:
+        raise HTTPException(status_code=502, detail=result["error"])
+    return result
+
+
+@app.get("/api/knowledge")
+async def list_knowledge():
+    return {"docs": _knowledge_docs}
+
+
+@app.post("/api/knowledge")
+async def add_knowledge(req: AgentTask):
+    doc = {
+        "id": str(len(_knowledge_docs) + 1),
+        "title": req.agent_id,
+        "content": req.task,
+        "source": "user",
+    }
+    _knowledge_docs.append(doc)
+    return {"doc": doc}
+
+
+@app.get("/api/admin/qdrant")
+async def admin_qdrant():
+    """Placeholder Qdrant/vector store stats for admin dashboard."""
+    qdrant_url = os.getenv("QDRANT_URL", "http://localhost:6333")
+    info = {
+        "url": qdrant_url,
+        "reachable": False,
+        "collection": "tangle_wiki_memories",
+        "points_count": 0,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=3.0) as client:
+            h = await client.get(f"{qdrant_url}/healthz")
+            info["reachable"] = h.status_code == 200
+            if info["reachable"]:
+                try:
+                    c = await client.get(f"{qdrant_url}/collections/tangle_wiki_memories")
+                    if c.status_code == 200:
+                        info["points_count"] = c.json().get("result", {}).get("points_count", 0)
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    info["knowledge_docs_count"] = len(_knowledge_docs)
+    return info
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

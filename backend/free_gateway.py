@@ -1,6 +1,6 @@
-"""Free AI API Gateway — routes to OpenRouter (free) and Google Gemini (free)"""
+"""Free AI API Gateway — routes to OpenRouter free models with circuit-breaker retry chain"""
 
-import os, time, json, asyncio
+import os, time, json, asyncio, logging
 from typing import Optional
 import httpx
 
@@ -216,24 +216,19 @@ class FreeGateway:
 
     async def _call_openrouter(self, model: str, messages: list[dict], tools: Optional[list] = None) -> dict:
         if not self.openrouter_key:
-            return await self._fallback_to_gemini(model, messages)
+            return {"error": "OpenRouter API key not set. Set OPENROUTER_API_KEY in .env", "provider": "openrouter"}
 
         # Circuit breaker check
         if not self._cb_should_allow("openrouter"):
-            import logging
             cb = self._cb["openrouter"]
             remaining_cooldown = cb["cooldown"] - (time.time() - cb["opened_at"])
-            logging.getLogger("tangle.gateway").info(
-                f"Circuit breaker OPEN for openrouter — "
-                f"falling back (cooldown {remaining_cooldown:.0f}s remaining)"
-            )
-            return await self._fallback_to_gemini(model, messages)
+            return {"error": f"OpenRouter circuit breaker open (cooldown {remaining_cooldown:.0f}s remaining)", "provider": "openrouter"}
 
         remaining = self._rate_limits["openrouter"]["remaining"]
         if remaining <= 0:
             wait = self._rate_limits["openrouter"]["reset"] - time.time()
             if wait > 0:
-                return await self._fallback_to_gemini(model, messages)
+                return {"error": f"OpenRouter rate limited (resets in {wait:.0f}s)", "provider": "openrouter"}
 
         body = {"model": model, "messages": messages, "max_tokens": 4096}
         if tools:
@@ -312,7 +307,8 @@ class FreeGateway:
             result = await self._call_single_openrouter(normalized, messages, tools)
             if "error" not in result:
                 return result
-        return await self._fallback_to_gemini(failed_model, messages)
+
+        return {"error": "All OpenRouter free models failed. No further fallback configured.", "provider": "openrouter"}
 
     async def _call_single_openrouter(self, model: str, messages: list[dict], tools: Optional[list] = None) -> dict:
         if not self.openrouter_key:
@@ -383,15 +379,6 @@ class FreeGateway:
             "finish_reason": candidate.get("finishReason", "STOP"),
             "usage": data.get("usageMetadata", {}),
         }
-
-    async def _fallback_to_gemini(self, model: str, messages: list[dict]) -> dict:
-        result = await self._call_gemini("gemini/gemini-2.0-flash-exp", messages)
-        if "error" not in result:
-            return result
-        ollama_result = await self._call_ollama(messages)
-        if "error" in ollama_result:
-            return {"error": f"All providers failed. OpenRouter: no key, Gemini: {result['error']}, Ollama: {ollama_result['error']}", "provider": "none"}
-        return ollama_result
 
     def _convert_to_gemini(self, messages: list[dict]) -> list[dict]:
         contents = []

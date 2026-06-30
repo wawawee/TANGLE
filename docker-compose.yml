@@ -1,14 +1,35 @@
-version: '3.8'
-services:
-  qdrant:
-    image: qdrant/qdrant:latest
-    ports:
-      - "6333:6333"
-      - "6334:6334"
-    volumes:
-      - ./twisted-stacks-agentic-team/qdrant/storage:/qdrant/storage
-    environment:
-      QDRANT__SERVICE__MAX_CONNECTIONS: 500
-      QDRANT__SERVICE__MAX_REQUEST_SIZE: 1048576
-      QDRANT__LOG_LEVEL: INFO
-    restart: unless-stopped
+# TANGLE: docker-compose
+#
+# TANGLE kör Qdrant **native** på macOS sedan juni 2026 (binary via nvm,
+# config i ~/.qdrant/config.yaml, autostart vid boot). Se start_qdrant.sh
+# om binären någonsin försvinner.
+#
+# Denna fil finns kvar som ett alternativ för den som vill köra Qdrant i
+# Docker (t.ex. CI, andra OS). För lokal dev på Mac: använd den nativa
+# Qdrant-binären — slipper hela Docker-lagret och RAM-kostnaden som
+# följer med det.
+#
+# ─── Starta Qdrant native istället ────────────────────────────────
+#   qdrant --config-path ~/.qdrant/config.yaml
+#   # eller: launchd-tjänst (se scripts/)
+#
+# ─── Vill du köra via Docker ändå? ─────────────────────────────────
+#   docker compose up -d qdrant
+#
+# ─── Supabase (auth/db/storage) ────────────────────────────────────
+# Hanteras INTE här. `supabase start` (CLI 2.98+) spinner sin egen
+# docker-compose från supabase/config.toml. Kräver Docker Desktop.
+
+# services:
+#   qdrant:
+#     image: qdrant/qdrant:latest
+#     ports:
+#       - "6333:6333"
+#       - "6334:6334"
+#     volumes:
+#       - ./twisted-stacks-agentic-team/qdrant/storage:/qdrant/storage
+#     environment:
+#       QDRANT__SERVICE__MAX_CONNECTIONS: 500
+#       QDRANT__SERVICE__MAX_REQUEST_SIZE: 1048576
+#       QDRANT__LOG_LEVEL: INFO
+#     restart: unless-stopped
