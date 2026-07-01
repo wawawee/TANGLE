@@ -209,7 +209,18 @@ interface ContradictionGraphProps {
   error?: string | null;
   onClose?: () => void;
   onAnalyze?: () => void;
+  jurisdiction?: string;
+  onJurisdictionChange?: (j: string) => void;
 }
+
+const JURISDICTIONS = [
+  { value: 'default', label: 'Default' },
+  { value: 'sweden', label: 'Sweden' },
+  { value: 'uae', label: 'UAE / Dubai' },
+  { value: 'uk', label: 'United Kingdom' },
+  { value: 'us', label: 'United States' },
+  { value: 'eu', label: 'European Union' },
+];
 
 function ContradictionGraphInner({
   result,
@@ -217,6 +228,8 @@ function ContradictionGraphInner({
   error,
   onClose,
   onAnalyze,
+  jurisdiction = 'default',
+  onJurisdictionChange,
 }: ContradictionGraphProps) {
   const [selectedEdge, setSelectedEdge] = useState<string | null>(null);
 
@@ -314,7 +327,7 @@ function ContradictionGraphInner({
           )}
         </div>
 
-        <div className="flex gap-3 text-xs font-mono">
+        <div className="flex gap-3 text-xs font-mono items-center">
           <span className="flex items-center gap-1">
             <span className="w-3 h-3 rounded-full" style={{ backgroundColor: '#ef4444' }} />
             <span className="dark:text-[#eee]">{byKind('intra_source')} intra</span>
@@ -327,6 +340,18 @@ function ContradictionGraphInner({
             <span className="w-3 h-3 rounded-full" style={{ backgroundColor: '#3b82f6' }} />
             <span className="dark:text-[#eee]">{byKind('legal')} legal</span>
           </span>
+          <span className="flex-1" />
+          {onJurisdictionChange && (
+            <select
+              value={jurisdiction}
+              onChange={(e) => onJurisdictionChange(e.target.value)}
+              className="text-[10px] font-mono bg-transparent border border-gray-600 rounded px-1 py-0.5 dark:text-[#eee] cursor-pointer"
+            >
+              {JURISDICTIONS.map((j) => (
+                <option key={j.value} value={j.value}>{j.label}</option>
+              ))}
+            </select>
+          )}
         </div>
       </div>
 

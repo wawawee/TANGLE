@@ -25,6 +25,7 @@ from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
 import guardrails
+from contradiction_engine import analyze_contradictions
 
 logger = logging.getLogger("tangle.phases")
 
@@ -102,6 +103,8 @@ class MissionContext:
     iteration_count: int = 0
     max_iterations: int = 3
     loop_feedback: str = ""
+    evidence_texts: List[Dict[str, str]] = field(default_factory=list)
+    contradiction_result: Optional[Dict[str, Any]] = None
 
 
 class MissionPhase(ABC):
@@ -238,6 +241,14 @@ class ResearchPhase(MissionPhase):
             safe, _ = guardrails.apply_post_guardrail("scout", f)
             sanitized.append(safe)
         ctx.findings = sanitized
+
+        # Capture evidence texts for contradiction analysis
+        ctx.evidence_texts = []
+        for i, finding in enumerate(ctx.findings):
+            ctx.evidence_texts.append({
+                "source": f"scout-{i}",
+                "text": finding[:2000],
+            })
 
         return ctx
 
@@ -488,6 +499,71 @@ class IngestionPhase(MissionPhase):
         return ctx
 
 
+class ContradictionPhase(MissionPhase):
+    """Optional Phase 7: Run contradiction detection on gathered evidence.
+
+    Uses the multi-pass contradiction engine to find intra-source,
+    inter-source, and legal contradictions in the research findings.
+    Can be toggled via TANGLE_CONTRADICTION_ENABLED env var.
+    """
+
+    async def execute(self, ctx: MissionContext) -> MissionContext:
+        enabled = os.getenv("TANGLE_CONTRADICTION_ENABLED", "0").strip() in ("1", "true", "yes")
+        if not enabled:
+            logger.info("Contradiction detection disabled (TANGLE_CONTRADICTION_ENABLED=0)")
+            return ctx
+
+        if not ctx.evidence_texts or len(ctx.evidence_texts) < 2:
+            logger.info("Not enough evidence texts for contradiction analysis")
+            return ctx
+
+        self._emit({
+            "type": "workflow_step", "agent_id": "maestro",
+            "task": f"Analyzing {len(ctx.evidence_texts)} evidence sources for contradictions"
+        })
+        logger.info(f"ContradictionPhase: analyzing {len(ctx.evidence_texts)} evidence texts")
+
+        try:
+            embed_fn = None
+            try:
+                embed_fn = self.orch.vector_store.get_embeddings
+            except Exception:
+                pass
+
+            jurisdiction = os.getenv("TANGLE_CONTRADICTION_JURISDICTION", "default")
+            result = await analyze_contradictions(
+                self.orch.gateway,
+                ctx.evidence_texts,
+                enable_legal=True,
+                jurisdiction=jurisdiction,
+                embed_fn=embed_fn,
+            )
+            ctx.contradiction_result = result
+
+            thread_count = len(result.get("threads", []))
+            if thread_count > 0:
+                self._emit({
+                    "type": "contradictions_found",
+                    "count": thread_count,
+                    "intra": result.get("total_intra", 0),
+                    "inter": result.get("total_inter", 0),
+                    "legal": result.get("total_legal", 0),
+                })
+                logger.info(f"ContradictionPhase: {thread_count} contradictions found")
+            else:
+                self._emit({
+                    "type": "contradictions_found",
+                    "count": 0,
+                    "detail": "No contradictions detected",
+                })
+                logger.info("ContradictionPhase: no contradictions found")
+        except Exception as e:
+            logger.warning(f"Contradiction analysis failed (non-fatal): {e}")
+            ctx.contradiction_result = {"error": str(e), "threads": []}
+
+        return ctx
+
+
 # Default phase pipeline for run_mission()
 DEFAULT_PHASES = [
     PlanningPhase,
@@ -495,4 +571,5 @@ DEFAULT_PHASES = [
     EvaluationPhase,
     SynthesisPhase,
     IngestionPhase,
+    ContradictionPhase,
 ]

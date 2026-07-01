@@ -945,6 +945,7 @@ class AgentOrchestrator:
                 "critic_critique": ctx.evaluation.get("critique"),
                 "usage": ctx.usage,
                 "wiki_export": ctx.wiki_export_summary,
+                "contradiction_result": ctx.contradiction_result,
             }
         except Exception as e:
             # Record failure metrics

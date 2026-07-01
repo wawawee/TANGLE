@@ -1242,6 +1242,7 @@ class MoARequest(BaseModel):
 class ContradictionRequest(BaseModel):
     evidence_texts: list[dict]
     entity: str = ""
+    jurisdiction: str = "default"
 
 @app.post("/api/moa/analyze")
 async def moa_analyze(req: MoARequest):
@@ -1275,7 +1276,8 @@ async def analyze_case_contradictions(req: ContradictionRequest):
     """Run contradiction detection on a set of evidence texts.
 
     Each item in evidence_texts must have {source, text}.
-    Optionally provide an entity name for context.
+    Optionally provide an entity name and jurisdiction context.
+    Returns both 'contradictions' (legacy flat array) and 'threads'+'claims' (graph structure).
     """
     if not _check_rate_limit("contradictions", max_requests=3, window=60.0):
         raise HTTPException(status_code=429, detail="Rate limit: max 3 contradiction analyses per minute")
@@ -1286,11 +1288,53 @@ async def analyze_case_contradictions(req: ContradictionRequest):
     try:
         logger.info(
             f"Contradiction analysis for {len(req.evidence_texts)} evidence items"
-            + (f" (entity={req.entity})" if req.entity else "")
+            + (f" (entity={req.entity}, jurisdiction={req.jurisdiction})" if req.entity else "")
         )
-        result = await analyze_contradictions(gateway, req.evidence_texts)
+
+        embed_fn = None
+        try:
+            from vector_store import VectorStore
+            vs = VectorStore()
+            embed_fn = vs.get_embeddings
+        except Exception:
+            pass
+
+        result = await analyze_contradictions(
+            gateway, req.evidence_texts,
+            enable_legal=True, jurisdiction=req.jurisdiction,
+            embed_fn=embed_fn,
+        )
         result["evidence_count"] = len(req.evidence_texts)
         result["entity"] = req.entity
+
+        # Backward-compatible flat contradictions array
+        claims_map = {c["id"]: c for c in result.get("claims", [])}
+        contradictions = []
+        for t in result.get("threads", []):
+            from_c = claims_map.get(t.get("from_claim_id", ""), {})
+            to_c = claims_map.get(t.get("to_claim_id", ""), {})
+            contradictions.append({
+                "kind": t.get("kind", "inter_source"),
+                "confidence": t.get("confidence", 0.5),
+                "severity": t.get("severity", "medium"),
+                "claim_excerpt": t.get("from_excerpt", ""),
+                "claim_source": from_c.get("source", ""),
+                "conflicts_with_excerpt": t.get("to_excerpt", ""),
+                "conflicts_with_source": to_c.get("source", ""),
+                "explanation": t.get("explanation", ""),
+            })
+        result["contradictions"] = contradictions
+
+        # key_claims from unique claim IDs involved in threads
+        involved = set()
+        for t in result.get("threads", []):
+            involved.add(t.get("from_claim_id", ""))
+            involved.add(t.get("to_claim_id", ""))
+        result["key_claims"] = [
+            c["excerpt"] for c in result.get("claims", [])
+            if c["id"] in involved
+        ]
+
         return result
     except Exception as e:
         logger.error(f"Contradiction analysis failed: {e}")

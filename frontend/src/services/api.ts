@@ -206,10 +206,11 @@ export async function getWittyResponse(query: string) {
 
 export async function analyzeContradictions(
   evidenceTexts: { source: string; text: string }[],
-  entity: string = ''
+  entity: string = '',
+  jurisdiction: string = 'default'
 ) {
   return apiFetch('/api/contradictions/analyze', {
     method: 'POST',
-    body: JSON.stringify({ evidence_texts: evidenceTexts, entity }),
+    body: JSON.stringify({ evidence_texts: evidenceTexts, entity, jurisdiction }),
   });
 }

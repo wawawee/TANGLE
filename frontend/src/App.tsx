@@ -14,6 +14,7 @@ import type { Connection, Edge, Node } from '@xyflow/react';
 import '@xyflow/react/dist/style.css';
 import { WhoNode } from './components/nodes/WhoNode';
 import { DropNode } from './components/nodes/DropNode';
+import { ClaimNode } from './components/nodes/ClaimNode';
 import { AgentNode } from './components/agentflow/AgentNode';
 import { Settings, Activity, Moon, Sun, Brain, Database, MessageCircle, RotateCcw, Zap, Terminal, FileText } from 'lucide-react';
 import { getWittyResponse } from './services/gemini';
@@ -38,7 +39,8 @@ import type { ContradictionResult } from './types/contradiction';
 const nodeTypes = {
   whoNode: WhoNode,
   dropNode: DropNode,
-  agent: AgentNode
+  agent: AgentNode,
+  claimNode: ClaimNode,
 };
 
 function FlowApp() {
@@ -66,6 +68,7 @@ function FlowApp() {
   const [contradictionResult, setContradictionResult] = useState<ContradictionResult | null>(null);
   const [contradictionLoading, setContradictionLoading] = useState(false);
   const [contradictionError, setContradictionError] = useState<string | null>(null);
+  const [contradictionJurisdiction, setContradictionJurisdiction] = useState('default');
   const [rightPanelTab, setRightPanelTab] = useState<'report' | 'contradictions' | 'deep'>('report');
   const [lastEvidenceTexts, setLastEvidenceTexts] = useState<{ source: string; text: string }[]>([]);
   const [decisionPoint, setDecisionPoint] = useState<any>(null);
@@ -188,17 +191,18 @@ function FlowApp() {
     setNodes((nds) => nds.map(n => n.id === dropNodeId ? { ...n, data: { ...n.data, wittyText } } : n));
   };
 
-  const runContradictionAnalysis = useCallback(async (evidenceTexts: { source: string; text: string }[]) => {
+  const runContradictionAnalysis = useCallback(async (evidenceTexts: { source: string; text: string }[], jurisdiction?: string) => {
     if (!evidenceTexts.length) return;
     setContradictionLoading(true);
     setContradictionError(null);
     setRightPanelTab('report');
+    const jur = jurisdiction ?? contradictionJurisdiction;
     try {
-      const result = await analyzeContradictions(evidenceTexts);
+      const result = await analyzeContradictions(evidenceTexts, '', jur);
       setContradictionResult(result as ContradictionResult);
       if (result.contradictions?.length > 0) {
         setRightPanelTab('contradictions');
-        addEventLog('SUCCESS', 'System', `Found ${result.contradictions.length} contradictions`);
+        addEventLog('SUCCESS', 'System', `Found ${result.contradictions.length} contradictions (jurisdiction: ${jur})`);
       } else {
         addEventLog('INFO', 'System', 'No contradictions detected in evidence');
       }
@@ -208,7 +212,7 @@ function FlowApp() {
     } finally {
       setContradictionLoading(false);
     }
-  }, [addEventLog]);
+  }, [addEventLog, contradictionJurisdiction]);
 
   const handleAnalyze = (nodeId: string, evidence: any[]) => {
     setNodes((nds) => nds.map(n => n.id === nodeId ? { ...n, data: { ...n.data, submitted: true } } : n));
@@ -461,7 +465,9 @@ function FlowApp() {
                     result={contradictionResult}
                     loading={contradictionLoading}
                     error={contradictionError}
-                    onAnalyze={() => runContradictionAnalysis(lastEvidenceTexts)}
+                    jurisdiction={contradictionJurisdiction}
+                    onJurisdictionChange={setContradictionJurisdiction}
+                    onAnalyze={() => runContradictionAnalysis(lastEvidenceTexts, contradictionJurisdiction)}
                   />
                 )}
                 {rightPanelTab === 'deep' && (

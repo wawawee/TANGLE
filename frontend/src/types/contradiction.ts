@@ -13,8 +13,32 @@ export interface Contradiction {
   explanation: string;
 }
 
+export interface ContradictionClaim {
+  id: string;
+  source: string;
+  speaker: string;
+  excerpt: string;
+}
+
+export interface ContradictionThread {
+  id: string;
+  kind: ContradictionKind;
+  severity: ContradictionSeverity;
+  from_claim_id: string;
+  to_claim_id: string;
+  from_excerpt: string;
+  to_excerpt: string;
+  explanation: string;
+  confidence: number;
+}
+
 export interface ContradictionResult {
   contradictions: Contradiction[];
+  claims: ContradictionClaim[];
+  threads: ContradictionThread[];
+  total_intra: number;
+  total_inter: number;
+  total_legal: number;
   summary: string;
   key_claims: string[];
   evidence_count: number;
