@@ -12,6 +12,7 @@ Each phase is independently testable and enables concurrent missions.
 
 import os
 import re
+import json
 import uuid
 import time
 import asyncio
@@ -19,7 +20,7 @@ import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Tuple
 
 logger = logging.getLogger("tangle.phases")
 
@@ -47,7 +48,10 @@ class MissionContext:
     wiki_entry_markdown: str = ""
     wiki_entry_chunk_id: str = ""
     wiki_export_summary: Optional[Dict[str, Any]] = None
+    execution_plan: str = ""
     usage: Dict[str, Any] = field(default_factory=dict)
+    selected_skills: List[Tuple[str, float]] = field(default_factory=list)
+    skill_context: str = ""
 
 
 class MissionPhase(ABC):
@@ -88,8 +92,11 @@ class PlanningPhase(MissionPhase):
         if ctx.wiki_entry:
             plan_prompt += f" We have ingested files containing: {ctx.wiki_entry['raw_content'][:500]}"
 
+        planner_prompt = self.orch.AGENT_DEFS["planner"]["prompt"].format(entity=ctx.entity_name)
+        if ctx.skill_context:
+            planner_prompt = f"{ctx.skill_context}\n\n{planner_prompt}"
         messages = [
-            {"role": "system", "content": self.orch.AGENT_DEFS["planner"]["prompt"].format(entity=ctx.entity_name)},
+            {"role": "system", "content": planner_prompt},
             {"role": "user", "content": plan_prompt}
         ]
 
@@ -120,14 +127,16 @@ class ResearchPhase(MissionPhase):
         scout_task = self.orch.delegate(
             f"Search for external background, vulnerabilities, and solutions for {ctx.entity_name}.",
             "scout",
-            ctx.entity_name
+            ctx.entity_name,
+            skill_context=ctx.skill_context,
         )
 
         if ctx.wiki_entry:
             lib_task = self.orch.delegate(
                 f"Extract all relevant help insights and details for {ctx.entity_name} from the uploaded documents.",
                 "librarian",
-                ctx.entity_name
+                ctx.entity_name,
+                skill_context=ctx.skill_context,
             )
             ctx.findings = list(await asyncio.gather(scout_task, lib_task))
         else:
@@ -201,18 +210,43 @@ class EvaluationPhase(MissionPhase):
 class SynthesisPhase(MissionPhase):
     """Phase 5: Synthesize final dual-output (report + wiki entry).
 
-    Produces both a human-readable report and a re-ingestable wiki entry
-    using the TANGLE delimiters.
+    Before synthesis, asks user to choose between solution approaches
+    when multiple viable paths exist. Falls back to generating options
+    from findings if none provided.
     """
 
     async def execute(self, ctx: MissionContext) -> MissionContext:
         self._emit({"type": "workflow_step", "agent_id": "maestro", "task": "Synthesizing master report"})
+
+        # Generate solution approaches for user to choose from
+        options = await self._generate_solution_options(ctx)
+
+        if len(options) > 1:
+            self._emit({"type": "event_log", "entry": {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "level": "INFO", "agent": "System",
+                "message": f"Generated {len(options)} solution approaches — awaiting user choice"
+            }})
+            chosen_id = await self.orch.request_decision(
+                mission_id=ctx.mission_id,
+                title="Choose a Solution Approach",
+                description="Based on the research, I've identified multiple viable paths forward. Pick one to shape the final report.",
+                options=options,
+            )
+            chosen = next((o for o in options if o["id"] == chosen_id), options[0])
+            ctx.execution_plan = chosen.get("title", "")
+            self._emit({"type": "event_log", "entry": {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "level": "INFO", "agent": "System",
+                "message": f"User chose: {chosen['title']}"
+            }})
 
         synth_result = await self.orch.synthesize(
             ctx.findings,
             ctx.entity_name,
             critic_score=ctx.evaluation.get("score"),
             verified=ctx.evaluation.get("verified", False),
+            skill_context=ctx.skill_context,
         )
 
         ctx.report_markdown = synth_result["report_markdown"]
@@ -220,6 +254,53 @@ class SynthesisPhase(MissionPhase):
         ctx.wiki_entry_chunk_id = synth_result["wiki_entry_chunk_id"]
 
         return ctx
+
+    async def _generate_solution_options(self, ctx: MissionContext) -> list[dict]:
+        """Use the orchestrator's delegate to generate solution approaches from findings."""
+        if not ctx.findings or len(ctx.findings) < 50:
+            return [{
+                "id": "default",
+                "title": "Standard Analysis",
+                "summary": "Proceed with the default synthesis approach based on all collected findings.",
+                "confidence": 0.85,
+                "pros": ["Covers all evidence", "Balanced approach"],
+                "cons": ["May lack specific strategic focus"],
+            }]
+
+        prompt = f"""Given these findings about "{ctx.entity_name}", suggest 2-3 distinct strategic approaches:
+
+Findings:
+{ctx.findings[:2000]}
+
+For each approach, provide:
+- A short title (3-6 words)
+- A one-sentence summary
+- 2-3 pros and 2-3 cons
+- A confidence score (0.0-1.0)
+
+Respond as JSON array: [{{"id":"str","title":"str","summary":"str","confidence":0.0,"pros":["str"],"cons":["str"]}}]"""
+
+        try:
+            result = await self.orch.gateway.chat(self.orch.default_model, [{"role": "user", "content": prompt}])
+            text = result.get("content", "")
+            # Extract JSON array from response
+            import re
+            match = re.search(r'\[.*?\]', text, re.DOTALL)
+            if match:
+                options = json.loads(match.group())
+                if isinstance(options, list) and len(options) > 0:
+                    return options
+        except Exception as e:
+            logger.warning(f"Failed to generate solution options: {e}")
+
+        return [{
+            "id": "default",
+            "title": "Standard Analysis",
+            "summary": f"Comprehensive analysis of {ctx.entity_name} based on all gathered evidence.",
+            "confidence": 0.85,
+            "pros": ["Based on all findings", "Systematic approach"],
+            "cons": ["Generic structure"],
+        }]
 
 
 class IngestionPhase(MissionPhase):

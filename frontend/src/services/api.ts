@@ -111,6 +111,10 @@ export async function getMissions(entity?: string) {
   return apiFetch(`/api/missions${params}`);
 }
 
+export async function getMission(missionId: string) {
+  return apiFetch(`/api/missions/${missionId}`);
+}
+
 export async function startMission(objective: string, entity: string = 'default', files: string[] = []) {
   return apiFetch('/api/mission/start', {
     method: 'POST',

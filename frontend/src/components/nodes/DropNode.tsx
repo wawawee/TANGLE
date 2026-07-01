@@ -1,5 +1,5 @@
 import { Handle, Position } from '@xyflow/react';
-import { Upload, Type, Camera, Mic, X, Check, Play, FileText, Video, Music, Loader2, Terminal } from 'lucide-react';
+import { Upload, Type, Camera, Mic, X, Check, Play, FileText, Video, Music, Loader2, Terminal, AlertTriangle } from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
 import { uploadFile, addKnowledgeDoc } from '../../services/api';
 
@@ -19,6 +19,7 @@ export function DropNode({ data, id }: any) {
   const [isDragOver, setIsDragOver] = useState(false);
   const [verboseMode, setVerboseMode] = useState(false);
   const [verboseLogs, setVerboseLogs] = useState<{ time: string; msg: string }[]>([]);
+  const [audioWarnings, setAudioWarnings] = useState<Record<string, { message: string; estimated_minutes?: number }>>({});
   const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
@@ -83,6 +84,7 @@ export function DropNode({ data, id }: any) {
 
   const removeEvidence = (evidenceId: string) => {
     setEvidence(prev => prev.filter(e => e.id !== evidenceId));
+    setAudioWarnings(prev => { const { [evidenceId]: _, ...rest } = prev; return rest; });
   };
 
   const AUDIO_EXTS = ['.wav', '.mp3', '.m4a', '.ogg', '.flac', '.aac', '.webm'];
@@ -96,7 +98,12 @@ export function DropNode({ data, id }: any) {
     if (verboseMode) addVerboseLog(`Uploading ${file.name} (${(file.size / 1024).toFixed(1)} KB)...`);
 
     try {
-      await uploadFile(file);
+      const response = await uploadFile(file);
+      if (response?.audio_warning) {
+        const w = response.audio_warning;
+        setAudioWarnings(prev => ({ ...prev, [evidenceId]: { message: w.message, estimated_minutes: w.estimated_minutes } }));
+        if (verboseMode) addVerboseLog(`⚠ ${w.message} (est. ${w.estimated_minutes} min transcription)`);
+      }
       if (verboseMode) addVerboseLog(`Upload complete — parsing ${file.name}...`);
       await new Promise(r => setTimeout(r, 200));
 
@@ -297,6 +304,14 @@ export function DropNode({ data, id }: any) {
                       </>
                     )}
                     <span className="font-mono text-xs truncate">{item.preview}</span>
+                    {audioWarnings[item.id] && (
+                      <span className="group/aw relative" title={audioWarnings[item.id].message}>
+                        <AlertTriangle size={12} className="text-amber-500 shrink-0 cursor-help" />
+                        <span className="absolute bottom-full left-1/2 -translate-x-1/2 mb-1 hidden group-hover/aw:block bg-[#111] text-amber-400 text-[10px] px-2 py-1 whitespace-nowrap border border-amber-500 z-10">
+                          {audioWarnings[item.id].message} ({audioWarnings[item.id].estimated_minutes} min)
+                        </span>
+                      </span>
+                    )}
                     {item.status === 'uploaded' && <Check size={12} className="text-[#00cc66] shrink-0" />}
                     {item.status === 'error' && <span className="text-[#ff003c] font-mono text-xs shrink-0">FAILED</span>}
                   </div>

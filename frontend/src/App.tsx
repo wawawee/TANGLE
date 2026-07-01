@@ -15,7 +15,7 @@ import '@xyflow/react/dist/style.css';
 import { WhoNode } from './components/nodes/WhoNode';
 import { DropNode } from './components/nodes/DropNode';
 import { AgentNode } from './components/agentflow/AgentNode';
-import { Settings, Activity, Moon, Sun, Brain, Database, MessageCircle, RotateCcw, Zap, Terminal } from 'lucide-react';
+import { Settings, Activity, Moon, Sun, Brain, Database, MessageCircle, RotateCcw, Zap, Terminal, FileText } from 'lucide-react';
 import { getWittyResponse } from './services/gemini';
 import { startMission } from './services/api';
 import { useCaseState } from './hooks/useCaseState';
@@ -27,6 +27,7 @@ import { CaseStatus } from './types/case';
 
 import { AdminDashboard } from './components/AdminDashboard';
 import { BuildMode } from './components/build/BuildMode';
+import { HistoryPanel } from './components/history/HistoryPanel';
 import { AgentChat } from './components/admin/AgentChat';
 import ContradictionGraph from './components/contradictions/ContradictionGraph';
 import { DecisionPoint } from './components/DecisionPoint';
@@ -55,6 +56,9 @@ function FlowApp() {
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [isAdminMode, setIsAdminMode] = useState(false);
   const [isBuildMode, setIsBuildMode] = useState(false);
+  const [showBuildPopup, setShowBuildPopup] = useState(false);
+  const [showHistory, setShowHistory] = useState(false);
+  const [showHistoryPopup, setShowHistoryPopup] = useState(false);
   const [showChat, setShowChat] = useState(false);
   const [isHoveringSettings, setIsHoveringSettings] = useState(false);
   const [deepResearch, setDeepResearch] = useState(false);
@@ -579,6 +583,24 @@ function FlowApp() {
                     <div className={`absolute top-0.5 w-6 h-6 rounded-full border-2 border-[#111] dark:border-[#eee] transition-transform ${isBuildMode ? 'translate-x-8 bg-[#00d4ff]' : 'translate-x-0.5 bg-gray-400'}`} />
                   </button>
                 </div>
+
+                <div className="flex items-center justify-between pt-4 border-t-2 border-[#111] dark:border-[#eee]">
+                  <div className="flex flex-col pr-4">
+                    <span className="font-mono font-bold flex items-center space-x-2 text-[#00ff88]">
+                      <FileText size={16} />
+                      <span>History</span>
+                    </span>
+                    <span className="text-xs text-gray-800 dark:text-gray-400 mt-1">
+                      Browse past mission reports and results.
+                    </span>
+                  </div>
+                  <button 
+                    onClick={() => setShowHistory(!showHistory)}
+                    className="w-16 h-8 border-2 border-[#111] dark:border-[#eee] rounded-full relative bg-[#f4f4f0] dark:bg-[#111] transition-colors shrink-0"
+                  >
+                    <div className={`absolute top-0.5 w-6 h-6 rounded-full border-2 border-[#111] dark:border-[#eee] transition-transform ${showHistory ? 'translate-x-8 bg-[#00ff88]' : 'translate-x-0.5 bg-gray-400'}`} />
+                  </button>
+                </div>
               </div>
 
               <div className="brutalist-card p-6 border-[#ff003c] dark:border-[#ff003c]">
@@ -587,23 +609,32 @@ function FlowApp() {
                   <span>Admin Dashboard</span>
                 </h3>
                 <p className="text-xs font-mono mb-4 text-gray-800 dark:text-gray-400">
-                  Access advanced configuration, memory management, token telemetry, and API keys.
-                  <br /><br />
-                  <span className="text-[#ff003c] font-bold">Shortcut:</span> Hover over the settings icon and press 'T'.
+                  Automated evaluation pipeline — runs missions across model combos overnight and scores results.
                 </p>
                 <button 
-                  onClick={() => setIsAdminMode(true)}
-                  className="w-full py-3 bg-[#ff003c] text-white font-black uppercase tracking-widest hover:bg-black transition-colors"
+                  onClick={() => {}}
+                  disabled
+                  className="w-full py-3 bg-gray-800 text-gray-500 font-black uppercase tracking-widest cursor-not-allowed"
                 >
-                  Launch Admin Mode
+                  Eval Mode (coming soon)
                 </button>
               </div>
             </div>
         </div>
       </div>
 
-      {isBuildMode && (
-        <BuildMode onClose={() => setIsBuildMode(false)} />
+      {showHistory && (
+        <>
+          <button
+            onClick={() => setShowHistoryPopup(!showHistoryPopup)}
+            className="fixed bottom-6 left-[136px] z-50 w-14 h-14 rounded-full bg-gradient-to-br from-[#00ff88] to-[#00cc66] text-white shadow-lg hover:shadow-xl hover:scale-110 transition-all flex items-center justify-center"
+            style={{ boxShadow: '0 4px 20px rgba(0, 255, 136, 0.4)' }}
+            title="Mission History"
+          >
+            <FileText size={24} />
+          </button>
+          <HistoryPanel isOpen={showHistoryPopup} onClose={() => setShowHistoryPopup(false)} />
+        </>
       )}
 
       {isAdminMode && (
@@ -616,15 +647,49 @@ function FlowApp() {
           title={decisionPoint.title || 'Choose a Path'}
           description={decisionPoint.description || 'The system found multiple approaches. Pick one to continue.'}
           options={decisionPoint.options || []}
-          onSelect={(optionId) => {
-            sendMessage('DECISION', { decisionId: decisionPoint.id, optionId });
+          onSelect={async (optionId) => {
+            try {
+              await fetch('/api/mission/decision', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mission_id: decisionPoint.id, option_id: optionId }),
+              });
+            } catch (e) {
+              console.error('Decision REST call failed, falling back to WS', e);
+              sendMessage('DECISION', { decisionId: decisionPoint.id, optionId });
+            }
             setDecisionPoint(null);
           }}
-          onDismiss={() => {
-            sendMessage('DECISION', { decisionId: decisionPoint.id, optionId: 'skip' });
+          onDismiss={async () => {
+            const firstOpt = decisionPoint.options?.[0]?.id || 'skip';
+            try {
+              await fetch('/api/mission/decision', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ mission_id: decisionPoint.id, option_id: firstOpt }),
+              });
+            } catch (e) {
+              console.error('Decision REST call failed, falling back to WS', e);
+              sendMessage('DECISION', { decisionId: decisionPoint.id, optionId: firstOpt });
+            }
             setDecisionPoint(null);
           }}
         />
+      )}
+
+      {/* Floating Build Mode Button (shown when Build Mode is toggled in settings) */}
+      {isBuildMode && (
+        <>
+          <button
+            onClick={() => setShowBuildPopup(!showBuildPopup)}
+            className="fixed bottom-6 left-[72px] z-50 w-14 h-14 rounded-full bg-gradient-to-br from-[#00d4ff] to-[#0088cc] text-white shadow-lg hover:shadow-xl hover:scale-110 transition-all flex items-center justify-center"
+            style={{ boxShadow: '0 4px 20px rgba(0, 212, 255, 0.4)' }}
+            title="Build Mode"
+          >
+            <Terminal size={24} />
+          </button>
+          <BuildMode isOpen={showBuildPopup} onClose={() => setShowBuildPopup(false)} />
+        </>
       )}
 
       {/* Floating Agent Chat Button */}

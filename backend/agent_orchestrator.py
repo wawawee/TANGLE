@@ -15,6 +15,7 @@ from free_gateway import FreeGateway
 from parsing_engine import ParsingEngine
 from vector_store import VectorStore
 from wiki_vault import WikiVault, export_on_mission_enabled
+from skill_router import SkillRouter
 from phases import (
     MissionContext, MissionPhase, DEFAULT_PHASES,
     PlanningPhase, ResearchPhase, EvaluationPhase, SynthesisPhase, IngestionPhase,
@@ -124,15 +125,32 @@ class AgentOrchestrator:
     def __init__(self, gateway: FreeGateway):
         self.gateway = gateway
         self.parser = ParsingEngine(gateway=gateway)
+        self.parser.on_event(lambda ev: self._emit(ev))
         self.vector_store = VectorStore()
         self.wiki_vault = WikiVault()
         self.callbacks: List[Callable[[Dict], None]] = []
         self._missions: Dict[str, MissionContext] = {}  # concurrent mission tracking
         self._current_mission_id: Optional[str] = None  # threaded to gateway for cost tracking
         # Global fallback only; delegate() prefers agent-specific list above.
-        self.default_model = "openrouter/meta-llama/llama-3.3-70b-instruct:free"
+        # Override via TANGLE_DEFAULT_MODEL env var, e.g. "lmstudio/google/gemma-4-26b-a4b"
+        self.default_model = os.getenv("TANGLE_DEFAULT_MODEL", "openrouter/meta-llama/llama-3.3-70b-instruct:free")
         # Phase pipeline (configurable via subclass or injection)
         self._phases: List[MissionPhase] = [phase(self) for phase in DEFAULT_PHASES]
+        # Pending user decisions (blocking mission until resolved)
+        self._pending_decisions: Dict[str, asyncio.Event] = {}
+        self._decision_results: Dict[str, str] = {}
+        # SkillRouter — embedding-based skill selection
+        skills_dir = os.path.join(os.path.dirname(__file__), "skills")
+        self.skill_router = SkillRouter(
+            skill_dir=skills_dir,
+            embed_fn=self._embed_for_skill,
+            threshold=float(os.getenv("TANGLE_SKILL_THRESHOLD", "0.60")),
+            top_k=int(os.getenv("TANGLE_SKILL_TOP_K", "5")),
+        )
+
+    async def _embed_for_skill(self, text: str) -> List[float]:
+        """Wrapper to reuse vector_store embeddings for SkillRouter."""
+        return await self.vector_store.get_embeddings(text)
 
     def _ctx(self) -> dict:
         """Build agent_context dict for gateway calls (carries mission_id)."""
@@ -149,6 +167,47 @@ class AgentOrchestrator:
                 cb(event)
             except Exception as e:
                 logger.error(f"Callback error: {e}")
+
+    # ── Decision Points (Human-in-the-Loop) ───────────
+
+    async def request_decision(self, mission_id: str, title: str, description: str, options: list[dict]) -> str:
+        """Emit a decision point and wait for user choice.
+
+        Each option: { id: str, title: str, summary: str, confidence: float, pros: list[str], cons: list[str] }
+        Returns the chosen option_id, or the first option if user skips.
+        """
+        event = {
+            "type": "DECISION_POINT",
+            "payload": {
+                "id": mission_id,
+                "title": title,
+                "description": description,
+                "options": options,
+            }
+        }
+        self._emit(event)
+
+        # Wait for user decision (with timeout fallback to first option)
+        ev = asyncio.Event()
+        self._pending_decisions[mission_id] = ev
+        try:
+            await asyncio.wait_for(ev.wait(), timeout=300.0)  # 5 min timeout
+        except asyncio.TimeoutError:
+            logger.warning(f"Decision timeout for mission {mission_id}, using first option")
+            self._decision_results[mission_id] = options[0]["id"]
+        finally:
+            self._pending_decisions.pop(mission_id, None)
+
+        return self._decision_results.pop(mission_id, options[0]["id"])
+
+    def resolve_decision(self, mission_id: str, option_id: str) -> bool:
+        """Resolve a pending decision — called from API endpoint."""
+        self._decision_results[mission_id] = option_id
+        ev = self._pending_decisions.get(mission_id)
+        if ev:
+            ev.set()
+            return True
+        return False
 
     # ─────────────────────────────────────────────────────────────
     # Core 6-Tool Surface (Pi Philosophy)
@@ -508,26 +567,36 @@ class AgentOrchestrator:
             }
 
     def _model_for_agent(self, agent_id: str) -> str:
-        """Pick the best free model for a given agent, falling back through the tier list."""
+        """Pick the best model for a given agent.
+
+        When default_model is local (lmstudio/), agents use it directly.
+        When default_model is remote (openrouter/), use the agent-specific
+        chain for role-optimized model selection.
+        """
+        if self.default_model.startswith("lmstudio/"):
+            return self.default_model
         chain = self.AGENT_MODELS.get(agent_id, self.AGENT_MODELS["default"])
         for candidate in chain:
-            # We don’t verify availability here — the gateway already handles retries/fallbacks.
             return candidate
         return self.default_model
 
-    async def delegate(self, task: str, agent_id: str, entity_name: str) -> str:
+    async def delegate(self, task: str, agent_id: str, entity_name: str, skill_context: str = "") -> str:
         """Tool 5: Delegate subtask to a specialized agent.
 
         Model selection is role-aware: planner/synthesizer lean toward structured-output
         coders, critic toward instruction-followers, scout/librarian toward generalists,
         image_analyst toward vision. Each role has an ordered fallback chain in
         `AGENT_MODELS`.
+
+        Args:
+            skill_context: Injected domain knowledge from SkillRouter (prepended to system prompt).
         """
         self._emit({"type": "sub_delegate", "from": "orchestrator", "to": agent_id, "task": task})
         self._emit({"type": "agent_start", "agent_id": agent_id, "task": task})
 
         agent_def = AGENT_DEFS.get(agent_id, {"name": "Assistant", "prompt": "You are a helpful assistant."})
-        system_prompt = agent_def["prompt"].format(entity=entity_name)
+        base_prompt = agent_def["prompt"].format(entity=entity_name)
+        system_prompt = f"{skill_context}\n\n{base_prompt}" if skill_context else base_prompt
 
         messages = [
             {"role": "system", "content": system_prompt},
@@ -570,7 +639,7 @@ class AgentOrchestrator:
             self._emit({"type": "agent_error", "agent_id": agent_id, "error": err})
             return err
 
-    async def synthesize(self, findings: List[str], entity_name: str, critic_score: Optional[float] = None, verified: bool = False) -> Dict[str, str]:
+    async def synthesize(self, findings: List[str], entity_name: str, critic_score: Optional[float] = None, verified: bool = False, skill_context: str = "") -> Dict[str, str]:
         """Tool 6: Synthesize all agent inputs into BOTH a human report AND a re-ingestable wiki entry.
 
         Returns dict with:
@@ -647,8 +716,11 @@ class AgentOrchestrator:
             f"===TANGLE_WIKI_END===\n"
         )
 
+        synth_prompt = AGENT_DEFS["synthesizer"]["prompt"].format(entity=entity_name)
+        if skill_context:
+            synth_prompt = f"{skill_context}\n\n{synth_prompt}"
         messages = [
-            {"role": "system", "content": AGENT_DEFS["synthesizer"]["prompt"].format(entity=entity_name)},
+            {"role": "system", "content": synth_prompt},
             {"role": "user", "content": prompt}
         ]
 
@@ -817,6 +889,16 @@ class AgentOrchestrator:
             # Step 1: Ingest file if provided (inline, not a phase)
             if uploaded_filepath:
                 ctx.wiki_entry = await self.ingest(uploaded_filepath, entity_name)
+
+            # Step 2: Skill selection (embedding match, no LLM call)
+            self._emit({"type": "workflow_step", "agent_id": "maestro", "task": "Selecting relevant domain skills"})
+            selected = await self.skill_router.select(entity_name, getattr(ctx, '_objective', ''))
+            ctx.selected_skills = selected
+            ctx.skill_context = self.skill_router.build_system_prompt(selected)
+            if selected:
+                skill_names = [f"{s[0]}({s[1]:.2f})" for s in selected]
+                logger.info(f"Skills selected for '{entity_name}': {skill_names}")
+                self._emit({"type": "skill_selection", "agent_id": "maestro", "skills": skill_names})
 
             # Execute phase pipeline
             for phase in self._phases:

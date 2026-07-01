@@ -4,6 +4,7 @@ import os
 import re
 import uuid
 import base64
+import time
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, List
@@ -42,6 +43,18 @@ class ParsingEngine:
         self.tag_model = "openrouter/nvidia/nemotron-nano-12b-v2-vl:free"
         self._marker_converter = None
         self._chunker = None
+        self._event_callbacks: list = []
+
+    def _emit_event(self, event_type: str, data: dict):
+        import time
+        for cb in self._event_callbacks:
+            try:
+                cb({"type": event_type, "payload": data, "ts": time.time()})
+            except Exception as e:
+                logger.warning(f"Event callback error: {e}")
+
+    def on_event(self, cb):
+        self._event_callbacks.append(cb)
 
     # Fixed taxonomy that the tag-generation prompt steers the LLM toward.
     # Model may invent new tags outside this list when none fit.
@@ -264,6 +277,68 @@ class ParsingEngine:
             return ["untagged"]
 
     async def _transcribe_audio(self, filepath: str, entity_name: str) -> tuple[str, float]:
+        """
+        Transcribe audio — local mlx-whisper (default) or OpenRouter Whisper fallback.
+        Controlled by TANGLE_AUDIO_SOURCE env var ('local' or 'openrouter').
+        """
+        source = os.environ.get("TANGLE_AUDIO_SOURCE", "local")
+
+        if source == "local":
+            return await self._transcribe_local(filepath)
+
+        return await self._transcribe_openrouter(filepath)
+
+    async def _transcribe_local(self, filepath: str) -> tuple[str, float]:
+        """Local mlx-whisper with GPU limiting, chunking, and progress events."""
+        from audio_transcriber import transcribe, estimate, get_duration
+
+        duration_s = get_duration(filepath)
+        est = estimate(duration_s)
+
+        if est["warning"]:
+            msg = est["warning_message"]
+            logger.warning(msg)
+            self._emit_event("transcription_warning", {
+                "message": msg,
+                "duration_hours": est["duration_hours"],
+                "estimated_minutes": est["estimated_transcription_min"],
+                "chunks": est["chunks"],
+            })
+
+        self._emit_event("transcription_start", {
+            "duration_s": duration_s,
+            "estimated_minutes": est["estimated_transcription_min"],
+            "chunks": est["chunks"],
+        })
+
+        import asyncio
+        loop = asyncio.get_event_loop()
+
+        def _run():
+            safe_emit = lambda done, total, eta: loop.call_soon_threadsafe(
+                self._emit_event, "transcription_progress", {
+                    "chunk": done,
+                    "total_chunks": total,
+                    "progress_pct": round(done / total * 100, 1) if total > 0 else 0,
+                    "eta_s": round(eta),
+                    "eta_formatted": f"{int(eta // 60)}m {int(eta % 60)}s" if eta > 0 else "done",
+                },
+            )
+            return transcribe(filepath, on_progress=safe_emit)
+
+        result = await loop.run_in_executor(None, _run)
+
+        self._emit_event("transcription_done", {
+            "text_len": len(result.get("text", "")),
+            "chunks": result["chunks"],
+            "elapsed_s": result["elapsed_s"],
+            "language": result["language"],
+        })
+
+        logger.info(f"Local transcription: {result['elapsed_s']}s for {result['chunks']} chunks")
+        return result["text"].strip(), 0.90
+
+    async def _transcribe_openrouter(self, filepath: str) -> tuple[str, float]:
         """
         Transcribe audio via OpenRouter Whisper.
         Calls POST /api/v1/audio/transcriptions with the audio file.

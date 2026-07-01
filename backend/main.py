@@ -157,6 +157,57 @@ async def get_agents():
     ]
 
 # ─────────────────────────────────────────────────────────────
+# Skills API (SkillRouter)
+# ─────────────────────────────────────────────────────────────
+@app.get("/skills")
+async def list_skills():
+    """List all loaded skills with metadata."""
+    await orchestrator.skill_router._ensure_loaded()
+    skill_ids = orchestrator.skill_router.get_active_skill_ids()
+    skills = []
+    for sid in skill_ids:
+        info = orchestrator.skill_router.get_skill_info(sid)
+        if info:
+            skills.append({
+                "id": sid,
+                "name": info.get("name", sid),
+                "version": info.get("version", "?"),
+                "always_include": info.get("always_include", False),
+                "keyword_count": len(info.get("embedding_keywords", [])),
+            })
+    return {"skills": skills, "count": len(skills)}
+
+@app.post("/skills/reload")
+async def reload_skills():
+    """Hot-reload all skills from disk (no restart needed)."""
+    await orchestrator.skill_router.reload()
+    count = len(orchestrator.skill_router.get_active_skill_ids())
+    return {"status": "reloaded", "skill_count": count}
+
+class SkillTestRequest(BaseModel):
+    entity: str
+    objective: str = ""
+    threshold: float = 0.60
+    top_k: int = 5
+
+@app.post("/skills/test")
+async def test_skills(req: SkillTestRequest):
+    """Test skill matching against an entity + objective without running a mission."""
+    selected = await orchestrator.skill_router.select(
+        req.entity, req.objective, threshold=req.threshold, top_k=req.top_k
+    )
+    prompt_prefix = orchestrator.skill_router.build_system_prompt(selected)
+    return {
+        "entity": req.entity,
+        "objective": req.objective,
+        "selected": [{"skill_id": sid, "relevance": round(score, 4)} for sid, score in selected],
+        "mcps": orchestrator.skill_router.get_mcps(selected),
+        "apis": orchestrator.skill_router.get_apis(selected),
+        "tools": orchestrator.skill_router.get_tools(selected),
+        "prompt_prefix_length": len(prompt_prefix),
+    }
+
+# ─────────────────────────────────────────────────────────────
 # System Monitor (Agent-16: WATCHDOG)
 # ─────────────────────────────────────────────────────────────
 def bytes_to_mb(b: int) -> float:
@@ -364,6 +415,16 @@ async def broadcast(agent_id: str, event: dict):
 async def handle_orchestrator_event(event: dict):
     agent_id = event.get("agent_id", "system")
     await broadcast(agent_id, event)
+    # Forward transcription events to Build Mode telemetry
+    etype = event.get("type", "")
+    if etype.startswith("transcription_"):
+        payload = event.get("payload", {})
+        await publish_build_event(
+            "transcription", "audio",
+            payload.get("message", event.get("type", "")),
+            detail=str(payload.get("progress_pct", "") or ""),
+            status="running" if etype in ("transcription_start", "transcription_progress") else "ok",
+        )
 
 # ── Build Mode WebSocket ──
 
@@ -494,11 +555,31 @@ async def upload_file(file: UploadFile = File(...), entity: str = Form(...)):
 
         parsed_data = await orchestrator.ingest(str(file_path), entity)
         await publish_build_event("api_call", "parsing", f"File ingested: {safe_name} for entity {entity}", status="ok")
+
+        # Audio duration check for long-file warning
+        audio_warning = None
+        ext = Path(safe_name).suffix.lower()
+        if ext in {".wav", ".mp3", ".m4a", ".ogg", ".flac", ".aac", ".webm"}:
+            try:
+                from audio_transcriber import get_duration, estimate
+                dur = get_duration(str(file_path))
+                est = estimate(dur)
+                if est["warning"]:
+                    audio_warning = {
+                        "message": est["warning_message"],
+                        "duration_hours": est["duration_hours"],
+                        "estimated_minutes": est["estimated_transcription_min"],
+                        "chunks": est["chunks"],
+                    }
+            except Exception as e:
+                logger.warning(f"Audio duration check failed: {e}")
+
         return {
             "success": True,
             "filename": safe_name,
             "filepath": str(file_path),
-            "parsed": parsed_data
+            "parsed": parsed_data,
+            "audio_warning": audio_warning,
         }
     except HTTPException:
         raise
@@ -551,6 +632,18 @@ async def start_mission(req: MissionRequest):
         logger.error(f"Mission failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
+class DecisionRequest(BaseModel):
+    mission_id: str
+    option_id: str
+
+@app.post("/api/mission/decision")
+async def submit_decision(req: DecisionRequest):
+    """Resolve a pending decision point — user chose a path."""
+    ok = orchestrator.resolve_decision(req.mission_id, req.option_id)
+    logger.info(f"Decision resolved: mission={req.mission_id} option={req.option_id} ok={ok}")
+    await publish_build_event("api_call", "orchestrator", f"Decision: {req.option_id[:60]}", detail=f"mission={req.mission_id[:12]}", status="ok")
+    return {"success": ok}
+
 class ReviewHarnessRequest(BaseModel):
     auto_commit: bool = False
     commit_message: str = ""
@@ -586,32 +679,48 @@ async def list_entities():
 
 @app.get("/api/missions")
 async def list_missions(entity: str = "", limit: int = 20):
-    """List missions, optionally filtered by entity name. Most recent first."""
+    """List missions (metadata only), optionally filtered by entity name. Most recent first."""
     try:
+        conn = sqlite3.connect(orchestrator.vector_store.db_path)
+        cursor = conn.cursor()
         if entity:
-            missions = orchestrator.vector_store.list_missions_for_entity(entity, limit)
-        else:
-            # Simple: return all missions across all entities
-            conn = sqlite3.connect(orchestrator.vector_store.db_path)
-            cursor = conn.cursor()
             cursor.execute(
-                "SELECT * FROM missions ORDER BY timestamp DESC LIMIT ?",
+                "SELECT mission_id, entity_name, status, timestamp FROM missions WHERE entity_name = ? ORDER BY timestamp DESC LIMIT ?",
+                (entity, limit),
+            )
+        else:
+            cursor.execute(
+                "SELECT mission_id, entity_name, status, timestamp FROM missions ORDER BY timestamp DESC LIMIT ?",
                 (limit,),
             )
-            rows = cursor.fetchall()
-            conn.close()
-            missions = []
-            for row in rows:
-                missions.append({
-                    "mission_id": row[0],
-                    "entity_name": row[1],
-                    "status": row[2],
-                    "report": row[3],
-                    "timestamp": row[4],
-                })
+        rows = cursor.fetchall()
+        conn.close()
+        missions = [
+            {
+                "mission_id": row[0],
+                "entity_name": row[1],
+                "status": row[2],
+                "timestamp": row[3],
+            }
+            for row in rows
+        ]
         return {"missions": missions, "count": len(missions)}
     except Exception as e:
         logger.error(f"Failed to list missions: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/missions/{mission_id}")
+async def get_mission(mission_id: str):
+    """Return full mission report by ID."""
+    try:
+        mission = orchestrator.vector_store.get_mission(mission_id)
+        if not mission:
+            raise HTTPException(status_code=404, detail="Mission not found")
+        return mission
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Failed to get mission {mission_id}: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 # ─────────────────────────────────────────────────────────────
