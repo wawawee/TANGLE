@@ -3,6 +3,7 @@
 import os
 import re
 import uuid
+import base64
 import logging
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any, Tuple, List
@@ -14,13 +15,33 @@ try:
     MARKITDOWN_AVAILABLE = True
 except ImportError:
     MARKITDOWN_AVAILABLE = False
-    logger.warning("markitdown not installed. Using simple fallback parsers.")
+
+try:
+    from marker.converters.pdf import PdfConverter
+    from marker.models import create_model_dict
+    from marker.output import text_from_rendered
+    MARKER_AVAILABLE = True
+except Exception as e:
+    MARKER_AVAILABLE = False
+    logger.warning(f"Marker PDF converter not available: {e}")
+
+try:
+    from chonkie import SemanticChunker
+    CHONKIE_AVAILABLE = True
+except Exception as e:
+    CHONKIE_AVAILABLE = False
+    logger.warning(f"Chonkie semantic chunker not available: {e}")
+
+AUDIO_EXTENSIONS = (".wav", ".mp3", ".m4a", ".ogg", ".flac", ".aac", ".webm")
+PDF_EXTENSIONS = (".pdf",)
 
 class ParsingEngine:
     def __init__(self, gateway=None):
         self.gateway = gateway
         self.mid = MarkItDown() if MARKITDOWN_AVAILABLE else None
         self.tag_model = "openrouter/nvidia/nemotron-nano-12b-v2-vl:free"
+        self._marker_converter = None
+        self._chunker = None
 
     # Fixed taxonomy that the tag-generation prompt steers the LLM toward.
     # Model may invent new tags outside this list when none fit.
@@ -43,13 +64,23 @@ class ParsingEngine:
         logger.info(f"Parsing file: {filename} ({ext}) for entity: {entity_name}")
 
         is_image = ext in (".png", ".jpg", ".jpeg", ".webp", ".gif")
+        is_audio = ext in AUDIO_EXTENSIONS
 
-        if is_image:
-            # Trigger vision pipeline
+        if is_audio:
+            content, confidence = await self._transcribe_audio(filepath, entity_name)
+        elif is_image:
             content, confidence = await self._parse_image_vision(filepath, entity_name)
+        elif ext in PDF_EXTENSIONS and MARKER_AVAILABLE:
+            marker_content, marker_err = await self._parse_with_marker(filepath)
+            if marker_content:
+                content = marker_content
+                confidence = 0.95
+            else:
+                logger.warning(f"Marker failed for {filename}, trying fallback: {marker_err}")
+                content, parse_error = self._fallback_parse(filepath)
+                confidence = 0.5
         elif MARKITDOWN_AVAILABLE and self.mid:
             try:
-                # Markitdown handles docx, xlsx, pptx, pdf, html, zip, etc.
                 result = self.mid.convert(filepath)
                 content = result.text_content
             except Exception as e:
@@ -58,7 +89,6 @@ class ParsingEngine:
                 confidence = 0.5
         else:
             content, parse_error = self._fallback_parse(filepath)
-            # Unify low-info confidence: 0.5 regardless of whether markitdown is installed
             if ext not in (".txt", ".md"):
                 confidence = 0.5
 
@@ -85,6 +115,8 @@ class ParsingEngine:
             f"- {tag_line}\n"
         )
 
+        chunks = self.chunk_content(content, filename)
+
         return {
             "chunk_id": chunk_id,
             "filename": filename,
@@ -94,8 +126,10 @@ class ParsingEngine:
             "confidence": round(confidence, 2),
             "timestamp": timestamp,
             "is_image": is_image,
+            "is_audio": is_audio,
             "parse_error": parse_error,
             "tags": tags,
+            "semantic_chunks": chunks,
         }
 
     @staticmethod
@@ -130,6 +164,44 @@ class ParsingEngine:
                 return f.read(), None
         except Exception as e:
             return f"[Parsing Error: Could not read file content. {e}]", str(e)
+
+    async def _parse_with_marker(self, filepath: str) -> Tuple[Optional[str], Optional[str]]:
+        """Parse a PDF using Marker (deep-learning PDF→markdown)."""
+        filename = os.path.basename(filepath)
+        logger.info(f"Marker parsing: {filename}")
+        try:
+            if not self._marker_converter:
+                self._marker_converter = PdfConverter(
+                    artifact_dict=create_model_dict(),
+                )
+            rendered = self._marker_converter(filepath)
+            text, _, images = text_from_rendered(rendered)
+            return text, None
+        except Exception as e:
+            logger.error(f"Marker error for {filename}: {e}", exc_info=True)
+            return None, str(e)
+
+    def chunk_content(self, content: str, filename: str, chunk_size: int = 1500) -> List[Dict[str, Any]]:
+        """Split content into semantic chunks using Chonkie. Falls back to naive split."""
+        if not content:
+            return [{"text": "", "start": 0, "end": 0}]
+
+        if CHONKIE_AVAILABLE:
+            try:
+                if not self._chunker:
+                    self._chunker = SemanticChunker(max_chunk_size=chunk_size)
+                chunks = self._chunker.chunk(content)
+                if chunks:
+                    return [{"text": c.text, "start": c.start_idx, "end": c.end_idx} for c in chunks]
+            except Exception as e:
+                logger.warning(f"Chonkie chunking failed for {filename}: {e}")
+
+        words = content.split()
+        chunked = []
+        for i in range(0, len(words), chunk_size):
+            segment = " ".join(words[i:i + chunk_size])
+            chunked.append({"text": segment, "start": i, "end": i + len(segment.split())})
+        return chunked
 
     async def _generate_tags(self, content: str, entity_name: str) -> List[str]:
         """Auto-generate 3-5 #tags for the chunk using a cheap LLM.
@@ -190,6 +262,68 @@ class ParsingEngine:
         except Exception as e:
             logger.warning(f"Tag generation failed for {entity_name}: {e}")
             return ["untagged"]
+
+    async def _transcribe_audio(self, filepath: str, entity_name: str) -> tuple[str, float]:
+        """
+        Transcribe audio via OpenRouter Whisper.
+        Calls POST /api/v1/audio/transcriptions with the audio file.
+        Falls back to a simple message on failure.
+        """
+        api_key = os.environ.get("OPENROUTER_API_KEY")
+        if not api_key:
+            return (
+                f"[Audio uploaded: {os.path.basename(filepath)}. "
+                "OPENROUTER_API_KEY not configured for transcription.]",
+                0.1
+            )
+
+        import httpx
+
+        filename = os.path.basename(filepath)
+        _, ext = os.path.splitext(filename)
+        mime_map = {
+            ".wav": "audio/wav",
+            ".mp3": "audio/mpeg",
+            ".m4a": "audio/mp4",
+            ".ogg": "audio/ogg",
+            ".flac": "audio/flac",
+            ".aac": "audio/aac",
+            ".webm": "audio/webm",
+        }
+        mime = mime_map.get(ext, "audio/mpeg")
+
+        logger.info(f"Transcribing audio: {filename} via OpenRouter Whisper")
+
+        try:
+            async with httpx.AsyncClient(timeout=120) as client:
+                with open(filepath, "rb") as f:
+                    files = {
+                        "model": (None, "openai/whisper-1"),
+                        "file": (filename, f, mime),
+                    }
+                    resp = await client.post(
+                        "https://openrouter.ai/api/v1/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        files=files,
+                    )
+                if resp.is_success:
+                    data = resp.json()
+                    text = data.get("text", "") or data.get("content", "")
+                    logger.info(f"Transcription success for {filename}: {len(text)} chars")
+                    return text.strip(), 0.85
+                else:
+                    logger.error(f"Transcription failed ({resp.status_code}): {resp.text[:200]}")
+                    return (
+                        f"[Audio file: {filename}. Transcription failed "
+                        f"(HTTP {resp.status_code}).]",
+                        0.2
+                    )
+        except Exception as e:
+            logger.error(f"Transcription error for {filename}: {e}")
+            return (
+                f"[Audio file: {filename}. Transcription error: {e}]",
+                0.1
+            )
 
     async def _parse_image_vision(self, filepath: str, entity_name: str) -> tuple[str, float]:
         """

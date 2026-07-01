@@ -1,5 +1,5 @@
 import { Handle, Position } from '@xyflow/react';
-import { Upload, Type, Camera, Mic, X, Check, Play, FileText, Video, Loader2, Terminal } from 'lucide-react';
+import { Upload, Type, Camera, Mic, X, Check, Play, FileText, Video, Music, Loader2, Terminal } from 'lucide-react';
 import { useState, useRef, useEffect } from 'react';
 import { uploadFile, addKnowledgeDoc } from '../../services/api';
 
@@ -19,6 +19,7 @@ export function DropNode({ data, id }: any) {
   const [isDragOver, setIsDragOver] = useState(false);
   const [verboseMode, setVerboseMode] = useState(false);
   const [verboseLogs, setVerboseLogs] = useState<{ time: string; msg: string }[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const logsEndRef = useRef<HTMLDivElement>(null);
@@ -84,9 +85,13 @@ export function DropNode({ data, id }: any) {
     setEvidence(prev => prev.filter(e => e.id !== evidenceId));
   };
 
+  const AUDIO_EXTS = ['.wav', '.mp3', '.m4a', '.ogg', '.flac', '.aac', '.webm'];
+
   const ingestFile = async (file: File) => {
     const evidenceId = Date.now().toString();
-    setEvidence(prev => [...prev, { id: evidenceId, type: 'file', preview: file.name, status: 'uploading' }]);
+    const ext = '.' + file.name.split('.').pop()?.toLowerCase();
+    const fileType = AUDIO_EXTS.includes(ext) ? 'audio' : 'file';
+    setEvidence(prev => [...prev, { id: evidenceId, type: fileType, preview: file.name, status: 'uploading' }]);
 
     if (verboseMode) addVerboseLog(`Uploading ${file.name} (${(file.size / 1024).toFixed(1)} KB)...`);
 
@@ -225,7 +230,7 @@ export function DropNode({ data, id }: any) {
               <Upload size={24} className="group-hover:-translate-y-1 transition-transform" />
               <span className="text-xs">Drop Files</span>
             </div>
-            <input type="file" multiple className="hidden" ref={fileInputRef} onChange={handleFileSelect} accept=".pdf,.txt,.csv,.json,.md,.doc,.docx,.png,.jpg,.jpeg,.gif,.webp" />
+            <input type="file" multiple className="hidden" ref={fileInputRef} onChange={handleFileSelect} accept=".pdf,.txt,.csv,.json,.md,.doc,.docx,.png,.jpg,.jpeg,.gif,.webp,.wav,.mp3,.m4a,.ogg,.flac,.aac,.webm" />
 
             <button onClick={() => setMode('text')} className="brutalist-button py-4 flex flex-col items-center justify-center space-y-2 group">
               <Type size={24} className="group-hover:-translate-y-1 transition-transform" />
@@ -285,6 +290,7 @@ export function DropNode({ data, id }: any) {
                     ) : (
                       <>
                         {item.type === 'file' && <FileText size={16} className="shrink-0" />}
+                        {item.type === 'audio' && <Music size={16} className="shrink-0" />}
                         {item.type === 'text' && <Type size={16} className="shrink-0" />}
                         {item.type === 'photo' && <Camera size={16} className="shrink-0" />}
                         {item.type === 'video' && <Video size={16} className="shrink-0" />}

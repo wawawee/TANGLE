@@ -15,7 +15,7 @@ import '@xyflow/react/dist/style.css';
 import { WhoNode } from './components/nodes/WhoNode';
 import { DropNode } from './components/nodes/DropNode';
 import { AgentNode } from './components/agentflow/AgentNode';
-import { Settings, Activity, Moon, Sun, Brain, Database, MessageCircle, RotateCcw } from 'lucide-react';
+import { Settings, Activity, Moon, Sun, Brain, Database, MessageCircle, RotateCcw, Zap } from 'lucide-react';
 import { getWittyResponse } from './services/gemini';
 import { startMission } from './services/api';
 import { useCaseState } from './hooks/useCaseState';
@@ -27,6 +27,7 @@ import { CaseStatus } from './types/case';
 import { AdminDashboard } from './components/AdminDashboard';
 import { AgentChat } from './components/admin/AgentChat';
 import ContradictionGraph from './components/contradictions/ContradictionGraph';
+import { MoaPanel } from './components/moa/MoaPanel';
 import { analyzeContradictions } from './services/api';
 import type { ContradictionResult } from './types/contradiction';
 
@@ -57,7 +58,7 @@ function FlowApp() {
   const [contradictionResult, setContradictionResult] = useState<ContradictionResult | null>(null);
   const [contradictionLoading, setContradictionLoading] = useState(false);
   const [contradictionError, setContradictionError] = useState<string | null>(null);
-  const [showContradictions, setShowContradictions] = useState(false);
+  const [rightPanelTab, setRightPanelTab] = useState<'report' | 'contradictions' | 'deep'>('report');
   const [lastEvidenceTexts, setLastEvidenceTexts] = useState<{ source: string; text: string }[]>([]);
   
   const {
@@ -179,12 +180,12 @@ function FlowApp() {
     if (!evidenceTexts.length) return;
     setContradictionLoading(true);
     setContradictionError(null);
-    setShowContradictions(false);
+    setRightPanelTab('report');
     try {
       const result = await analyzeContradictions(evidenceTexts);
       setContradictionResult(result as ContradictionResult);
       if (result.contradictions?.length > 0) {
-        setShowContradictions(true);
+        setRightPanelTab('contradictions');
         addEventLog('SUCCESS', 'System', `Found ${result.contradictions.length} contradictions`);
       } else {
         addEventLog('INFO', 'System', 'No contradictions detected in evidence');
@@ -267,7 +268,7 @@ function FlowApp() {
     setContradictionResult(null);
     setContradictionLoading(false);
     setContradictionError(null);
-    setShowContradictions(false);
+    setRightPanelTab('report');
     setLastEvidenceTexts([]);
     setPendingAnalysis(null);
     setShowSidebar(false);
@@ -386,15 +387,15 @@ function FlowApp() {
           </Panel>
         )}
 
-        {/* Right panel: Strategy/Report + Contradictions */}
+        {/* Right panel: Report / Contradictions / Deep */}
         {caseState.status !== CaseStatus.IDLE && (
           <Panel position="top-right" className="w-[500px] max-h-[85vh] pointer-events-none mr-16">
             <div className="pointer-events-auto flex flex-col h-full min-h-[400px]">
               <div className="flex gap-0 mb-2">
                 <button
-                  onClick={() => setShowContradictions(false)}
+                  onClick={() => setRightPanelTab('report')}
                   className={`font-bold uppercase px-3 py-1.5 text-xs transition-colors ${
-                    !showContradictions
+                    rightPanelTab === 'report'
                       ? 'bg-[#111] text-white dark:bg-[#eee] dark:text-[#111]'
                       : 'bg-white/80 dark:bg-black/80 text-[#111] dark:text-[#eee] hover:bg-gray-200 dark:hover:bg-gray-800'
                   }`}
@@ -402,9 +403,9 @@ function FlowApp() {
                   Report
                 </button>
                 <button
-                  onClick={() => setShowContradictions(true)}
+                  onClick={() => setRightPanelTab('contradictions')}
                   className={`font-bold uppercase px-3 py-1.5 text-xs transition-colors ${
-                    showContradictions
+                    rightPanelTab === 'contradictions'
                       ? 'bg-[#111] text-white dark:bg-[#eee] dark:text-[#111]'
                       : 'bg-white/80 dark:bg-black/80 text-[#111] dark:text-[#eee] hover:bg-gray-200 dark:hover:bg-gray-800'
                   }`}
@@ -416,9 +417,20 @@ function FlowApp() {
                     </span>
                   )}
                 </button>
+                <button
+                  onClick={() => setRightPanelTab('deep')}
+                  className={`font-bold uppercase px-3 py-1.5 text-xs transition-colors ${
+                    rightPanelTab === 'deep'
+                      ? 'bg-[#111] text-white dark:bg-[#eee] dark:text-[#111]'
+                      : 'bg-white/80 dark:bg-black/80 text-[#111] dark:text-[#eee] hover:bg-gray-200 dark:hover:bg-gray-800'
+                  }`}
+                >
+                  <Zap size={12} className="inline mr-1" />
+                  Deep
+                </button>
               </div>
               <div className="flex-1 border-4 border-[#111] bg-white/90 backdrop-blur-md overflow-hidden dark:border-[#eee] dark:bg-[#0a0a0a]/90 shadow-[8px_8px_0px_0px_rgba(17,17,17,0.3)] dark:shadow-[8px_8px_0px_0px_rgba(238,238,238,0.3)]">
-                {!showContradictions ? (
+                {rightPanelTab === 'report' && (
                   caseState.status === CaseStatus.COMPLETE ? (
                     <ReportViewer deliverables={caseState.deliverables} />
                   ) : (
@@ -427,12 +439,19 @@ function FlowApp() {
                       <p className="font-mono text-sm uppercase">Awaiting Swarm Consensus...</p>
                     </div>
                   )
-                ) : (
+                )}
+                {rightPanelTab === 'contradictions' && (
                   <ContradictionGraph
                     result={contradictionResult}
                     loading={contradictionLoading}
                     error={contradictionError}
                     onAnalyze={() => runContradictionAnalysis(lastEvidenceTexts)}
+                  />
+                )}
+                {rightPanelTab === 'deep' && (
+                  <MoaPanel
+                    evidenceTexts={lastEvidenceTexts}
+                    entityName={caseState.stage ? 'Case' : ''}
                   />
                 )}
               </div>

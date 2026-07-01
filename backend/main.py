@@ -79,6 +79,7 @@ from run_history import RunHistory
 from wiki_vault import WikiVault
 import metrics as tangle_metrics
 from contradiction_engine import analyze_contradictions, format_contradiction_report
+from moa_engine import MoAEngine
 
 gateway = FreeGateway()
 orchestrator = AgentOrchestrator(gateway)
@@ -88,6 +89,7 @@ task_manager = TaskListManager()
 kanban_board = KanbanBoard()
 run_history = RunHistory()
 wiki_vault = WikiVault()
+moa_engine = MoAEngine(gateway)
 
 app = FastAPI(title="TANGLE Agentic API")
 
@@ -1061,9 +1063,40 @@ async def swarm_websocket(ws: WebSocket, case_id: str):
             _swarm_connections.pop(case_id, None)
 
 
-class ContradictionRequest(BaseModel):
-    evidence_texts: list[dict[str, str]] = []
+class MoARequest(BaseModel):
+    prompt: str
+    system_prompt: str = ""
     entity: str = ""
+
+class ContradictionRequest(BaseModel):
+    evidence_texts: list[dict]
+    entity: str = ""
+
+@app.post("/api/moa/analyze")
+async def moa_analyze(req: MoARequest):
+    """Run Mixture of Agents deep analysis on a prompt.
+
+    Runs 3 reference models in parallel, then an aggregator model
+    synthesizes their outputs into a final answer.
+    Returns a Server-Sent Events stream.
+    """
+    if not _check_rate_limit("moa", max_requests=3, window=60.0):
+        raise HTTPException(status_code=429, detail="Rate limit: max 3 MoA analyses per minute")
+    if not req.prompt.strip():
+        raise HTTPException(status_code=400, detail="Prompt is required")
+
+    from fastapi.responses import StreamingResponse
+    logger.info(f"MoA analysis: prompt_len={len(req.prompt)} entity={req.entity or 'none'}")
+
+    return StreamingResponse(
+        moa_engine.analyze(req.prompt, req.system_prompt),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
 
 @app.post("/api/contradictions/analyze")
 async def analyze_case_contradictions(req: ContradictionRequest):
