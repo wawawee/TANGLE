@@ -9,8 +9,7 @@ venv/
 env/
 *.egg-info/
 dist/
-build/
-.eggs/
+/build/.eggs/
 
 # Environment
 .env
