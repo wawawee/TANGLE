@@ -199,3 +199,17 @@ Per senaste OpenRouter-modellgenomgång (2026-06-29):
 - ❓ Should `headroom` integration also surface compression stats in the React Flow canvas (a "compression-stats" node type)?
 - ❓ Should `last30days` be primary scout or kept as fallback (next to Jina/SerpAPI)?
 - ❓ Order of phases above — happy with headroom → last30days → promptfoo → Heretic → OpenViking → open-notebook, or want different sequence?
+
+---
+
+## 💡 FUTURE — Phase 1+
+
+Ideas från Kimis review (June 2026) som inte är Phase 0 scope men värda att dokumentera:
+
+- [ ] **MCP-wrappers för externa tools** — egna Python-wrappers för Sherlock CLI, HaveIBeenPwned, Shodan (free tier). Alternativ till att vänta på MCP Python SDK. Börja med 3-5 viktigaste.
+- [ ] **Frontend: Active Skills badge** — visa vilka skills som är laddade för nuvarande mission. Liten badge ovanför/canvas som visar skill-names + confidence scores.
+- [ ] **Root-level skills/ directory** — spegla `backend/skills/` på repo root för discoverability. Inkludera SKILL_ARCHITECTURE.md, SKILL_REGISTRY.md, SKILL_TEMPLATE.md som referens.
+- [ ] **Nya skills: sanctions_compliance.md, uae_corporate.md, medical.md** — Kimi skrev redan dessa. Lägg till när behov uppstår. Sanctions + UAE är högst prio för Dubai-pitch.
+- [ ] **SkillRouter edge case-tester** — fler tester för: tom embedding, concurrent select-anrop, korrupt YAML frontmatter, extremt långa entity names, skill-dir tom/finns inte.
+- [ ] **README-sektion om skills** — hur de fungerar (embedding match), hur man lägger till en ny, API key requirements, badge overview.
+- [ ] **Phase 2: Autoresearch / Eval loop** — batch-kör missions mot test cases, utvärdera rapportkvalitet, auto-regression. Kräver Eval Mode UI.
