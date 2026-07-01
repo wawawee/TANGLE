@@ -1095,15 +1095,26 @@ async def swarm_websocket(ws: WebSocket, case_id: str):
     try:
         data = await ws.receive_text()
         msg = json.loads(data)
-        if msg.get("action") == "START_ANALYSIS":
-            query = msg.get("query", "")
-            deep_research = msg.get("deepResearch", False)
+        # Support both { action: "..." } and { type: "..." } formats
+        action = msg.get("action") or msg.get("type", "")
+        if action == "START_ANALYSIS":
+            query = msg.get("query") or (msg.get("payload", {}) or {}).get("query", "")
+            deep_research = msg.get("deepResearch") or (msg.get("payload", {}) or {}).get("deepResearch", False)
             await _broadcast_swarm(case_id, {"type": "event_log", "entry": {
                 "timestamp": datetime.utcnow().isoformat(),
                 "level": "INFO", "agent": "System",
                 "message": f"Analysis started. Query length: {len(query)} chars. Deep research: {deep_research}."
             }})
             await _run_swarm_agents(case_id, query, deep_research)
+        elif action == "DECISION":
+            decision_id = msg.get("decisionId") or (msg.get("payload", {}) or {}).get("decisionId", "")
+            option_id = msg.get("optionId") or (msg.get("payload", {}) or {}).get("optionId", "")
+            logger.info(f"Swarm decision received: case={case_id} decision={decision_id} option={option_id}")
+            await _broadcast_swarm(case_id, {"type": "event_log", "entry": {
+                "timestamp": datetime.utcnow().isoformat(),
+                "level": "INFO", "agent": "System",
+                "message": f"Decision made: {option_id}"
+            }})
     except WebSocketDisconnect:
         pass
     except json.JSONDecodeError:

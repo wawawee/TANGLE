@@ -19,6 +19,7 @@ import { Settings, Activity, Moon, Sun, Brain, Database, MessageCircle, RotateCc
 import { getWittyResponse } from './services/gemini';
 import { startMission } from './services/api';
 import { useCaseState } from './hooks/useCaseState';
+import { useAutoLayout } from './hooks/useAutoLayout';
 import { useWebSocket } from './hooks/useWebSocket';
 import { EventLog } from './components/eventlog/EventLog';
 import { ReportViewer } from './components/report/ReportViewer';
@@ -28,6 +29,7 @@ import { AdminDashboard } from './components/AdminDashboard';
 import { BuildMode } from './components/build/BuildMode';
 import { AgentChat } from './components/admin/AgentChat';
 import ContradictionGraph from './components/contradictions/ContradictionGraph';
+import { DecisionPoint } from './components/DecisionPoint';
 import { MoaPanel } from './components/moa/MoaPanel';
 import { analyzeContradictions } from './services/api';
 import type { ContradictionResult } from './types/contradiction';
@@ -62,6 +64,9 @@ function FlowApp() {
   const [contradictionError, setContradictionError] = useState<string | null>(null);
   const [rightPanelTab, setRightPanelTab] = useState<'report' | 'contradictions' | 'deep'>('report');
   const [lastEvidenceTexts, setLastEvidenceTexts] = useState<{ source: string; text: string }[]>([]);
+  const [decisionPoint, setDecisionPoint] = useState<any>(null);
+  
+  const { layoutNodes } = useAutoLayout();
   
   const {
     caseState,
@@ -87,6 +92,7 @@ function FlowApp() {
       }));
     },
     onComplete: setDeliverables,
+    onDecision: setDecisionPoint,
     onError: (err) => addEventLog('ERROR', 'System', err.message)
   });
 
@@ -213,12 +219,12 @@ function FlowApp() {
     const spread = Math.min(360, (safeRightEdge - baseX) / 2 - 40);
 
     const newNodes: Node[] = [
-      { id: 'coordinator', type: 'agent', position: { x: baseX, y: baseY }, data: { name: 'Coordinator Alpha', role: 'orchestrator', state: 'active' } },
-      { id: 'context_weaver', type: 'agent', position: { x: baseX - spread, y: baseY + 220 }, data: { name: 'Context Weaver', role: 'analysis', state: 'idle' } },
-      { id: 'echo_vault', type: 'agent', position: { x: Math.min(baseX + spread, safeRightEdge - 280), y: baseY + 220 }, data: { name: 'Echo Vault', role: 'memory', state: 'idle' } },
-      { id: 'outcome_architect', type: 'agent', position: { x: baseX, y: baseY + 440 }, data: { name: 'Outcome Architect', role: 'strategy', state: 'idle' } },
-      { id: 'chronicle_scribe', type: 'agent', position: { x: baseX - spread + 60, y: baseY + 660 }, data: { name: 'Chronicle Scribe', role: 'documentation', state: 'idle' } },
-      { id: 'pulse_monitor', type: 'agent', position: { x: Math.min(baseX + spread - 60, safeRightEdge - 280), y: baseY + 660 }, data: { name: 'Pulse Monitor', role: 'telemetry', state: 'idle' } }
+      { id: 'coordinator', type: 'agent', position: { x: baseX, y: baseY }, data: { name: 'Coordinator Alpha', role: 'orchestrator', state: 'active', layoutHeight: 200 } },
+      { id: 'context_weaver', type: 'agent', position: { x: baseX - spread, y: baseY + 220 }, data: { name: 'Context Weaver', role: 'analysis', state: 'idle', layoutHeight: 200 } },
+      { id: 'echo_vault', type: 'agent', position: { x: Math.min(baseX + spread, safeRightEdge - 280), y: baseY + 220 }, data: { name: 'Echo Vault', role: 'memory', state: 'idle', layoutHeight: 200 } },
+      { id: 'outcome_architect', type: 'agent', position: { x: baseX, y: baseY + 440 }, data: { name: 'Outcome Architect', role: 'strategy', state: 'idle', layoutHeight: 200 } },
+      { id: 'chronicle_scribe', type: 'agent', position: { x: baseX - spread + 60, y: baseY + 660 }, data: { name: 'Chronicle Scribe', role: 'documentation', state: 'idle', layoutHeight: 200 } },
+      { id: 'pulse_monitor', type: 'agent', position: { x: Math.min(baseX + spread - 60, safeRightEdge - 280), y: baseY + 660 }, data: { name: 'Pulse Monitor', role: 'telemetry', state: 'idle', layoutHeight: 200 } }
     ];
 
     const strokeColor = isDarkMode ? '#eee' : '#111';
@@ -235,7 +241,11 @@ function FlowApp() {
     setNodes(nds => [...nds, ...newNodes]);
     setEdges(eds => [...eds, ...newEdges]);
 
-    setTimeout(() => fitView({ padding: 0.2, duration: 800 }), 100);
+    // Auto-layout all nodes after a brief render tick
+    setTimeout(() => {
+      setNodes(nds => layoutNodes(nds, edges));
+      setTimeout(() => fitView({ padding: 0.2, duration: 800 }), 150);
+    }, 50);
 
     const query = evidence.map(e => e.content || e.preview).join('\n\n');
     setPendingAnalysis({ query, deepResearch });
@@ -598,6 +608,23 @@ function FlowApp() {
 
       {isAdminMode && (
         <AdminDashboard onClose={() => setIsAdminMode(false)} />
+      )}
+
+      {/* Decision Point — user chooses between solution paths */}
+      {decisionPoint && (
+        <DecisionPoint
+          title={decisionPoint.title || 'Choose a Path'}
+          description={decisionPoint.description || 'The system found multiple approaches. Pick one to continue.'}
+          options={decisionPoint.options || []}
+          onSelect={(optionId) => {
+            sendMessage('DECISION', { decisionId: decisionPoint.id, optionId });
+            setDecisionPoint(null);
+          }}
+          onDismiss={() => {
+            sendMessage('DECISION', { decisionId: decisionPoint.id, optionId: 'skip' });
+            setDecisionPoint(null);
+          }}
+        />
       )}
 
       {/* Floating Agent Chat Button */}

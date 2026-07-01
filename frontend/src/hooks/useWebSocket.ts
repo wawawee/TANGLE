@@ -6,6 +6,7 @@ interface UseWebSocketOptions {
   onAgentThought: (thought: AgentThought) => void;
   onEventLog: (entry: EventLogEntry) => void;
   onTokenUsage?: (usage: any) => void;
+  onDecision?: (decision: any) => void;
   onComplete: (deliverables: unknown) => void;
   onError: (error: Error) => void;
 }
@@ -49,6 +50,11 @@ export function useWebSocket(options: UseWebSocketOptions) {
             break;
           case 'COMPLETE':
             options.onComplete(data.payload);
+            break;
+          case 'DECISION_POINT':
+            if (options.onDecision) {
+              options.onDecision(data.payload);
+            }
             break;
           case 'ERROR':
             options.onError(new Error(data.payload));
