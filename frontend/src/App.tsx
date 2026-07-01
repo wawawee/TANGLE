@@ -15,7 +15,7 @@ import '@xyflow/react/dist/style.css';
 import { WhoNode } from './components/nodes/WhoNode';
 import { DropNode } from './components/nodes/DropNode';
 import { AgentNode } from './components/agentflow/AgentNode';
-import { Settings, Activity, Moon, Sun, Brain, Database, MessageCircle, RotateCcw, Zap } from 'lucide-react';
+import { Settings, Activity, Moon, Sun, Brain, Database, MessageCircle, RotateCcw, Zap, Terminal } from 'lucide-react';
 import { getWittyResponse } from './services/gemini';
 import { startMission } from './services/api';
 import { useCaseState } from './hooks/useCaseState';
@@ -25,6 +25,7 @@ import { ReportViewer } from './components/report/ReportViewer';
 import { CaseStatus } from './types/case';
 
 import { AdminDashboard } from './components/AdminDashboard';
+import { BuildMode } from './components/build/BuildMode';
 import { AgentChat } from './components/admin/AgentChat';
 import ContradictionGraph from './components/contradictions/ContradictionGraph';
 import { MoaPanel } from './components/moa/MoaPanel';
@@ -51,6 +52,7 @@ function FlowApp() {
   const [sidebarTab, setSidebarTab] = useState<'settings'>('settings');
   const [isDarkMode, setIsDarkMode] = useState(true);
   const [isAdminMode, setIsAdminMode] = useState(false);
+  const [isBuildMode, setIsBuildMode] = useState(false);
   const [showChat, setShowChat] = useState(false);
   const [isHoveringSettings, setIsHoveringSettings] = useState(false);
   const [deepResearch, setDeepResearch] = useState(false);
@@ -549,6 +551,24 @@ function FlowApp() {
                     <div className={`absolute top-0.5 w-6 h-6 rounded-full border-2 border-[#111] dark:border-[#eee] transition-transform ${isAdminMode ? 'translate-x-8 bg-[#ff003c]' : 'translate-x-0.5 bg-gray-400'}`} />
                   </button>
                 </div>
+
+                <div className="flex items-center justify-between pt-4 border-t-2 border-[#111] dark:border-[#eee]">
+                  <div className="flex flex-col pr-4">
+                    <span className="font-mono font-bold flex items-center space-x-2 text-[#00d4ff]">
+                      <Terminal size={16} />
+                      <span>Build Mode</span>
+                    </span>
+                    <span className="text-xs text-gray-800 dark:text-gray-400 mt-1">
+                      Terminal, live telemetry, and color schemes.
+                    </span>
+                  </div>
+                  <button 
+                    onClick={() => setIsBuildMode(!isBuildMode)}
+                    className="w-16 h-8 border-2 border-[#111] dark:border-[#eee] rounded-full relative bg-[#f4f4f0] dark:bg-[#111] transition-colors shrink-0"
+                  >
+                    <div className={`absolute top-0.5 w-6 h-6 rounded-full border-2 border-[#111] dark:border-[#eee] transition-transform ${isBuildMode ? 'translate-x-8 bg-[#00d4ff]' : 'translate-x-0.5 bg-gray-400'}`} />
+                  </button>
+                </div>
               </div>
 
               <div className="brutalist-card p-6 border-[#ff003c] dark:border-[#ff003c]">
@@ -571,6 +591,10 @@ function FlowApp() {
             </div>
         </div>
       </div>
+
+      {isBuildMode && (
+        <BuildMode onClose={() => setIsBuildMode(false)} />
+      )}
 
       {isAdminMode && (
         <AdminDashboard onClose={() => setIsAdminMode(false)} />

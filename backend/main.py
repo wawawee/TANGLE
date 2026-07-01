@@ -9,6 +9,7 @@ import subprocess
 import signal
 import os, json, shutil
 import asyncio
+import uuid
 import logging
 import sqlite3
 from datetime import datetime, timezone
@@ -313,16 +314,25 @@ async def execute_terminal(cmd: TerminalCommand):
             )
         except asyncio.TimeoutError:
             process.kill()
+            await publish_build_event("terminal", "api", f"Command timed out: {cmd.command[:80]}", status="error")
             return {
                 "output": f"[TIMEOUT] Command exceeded {cmd.timeout}s limit",
                 "stderr": "",
                 "exit_code": -1,
             }
 
+        exit_code = process.returncode
+        await publish_build_event(
+            "terminal", "api",
+            f"$ {cmd.command[:120]}",
+            f"exit={exit_code}, out={len(stdout)}B, err={len(stderr)}B",
+            "ok" if exit_code == 0 else "warn",
+        )
+
         return {
             "output": stdout.decode(errors="replace"),
             "stderr": stderr.decode(errors="replace"),
-            "exit_code": process.returncode,
+            "exit_code": exit_code,
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -354,6 +364,43 @@ async def broadcast(agent_id: str, event: dict):
 async def handle_orchestrator_event(event: dict):
     agent_id = event.get("agent_id", "system")
     await broadcast(agent_id, event)
+
+# ── Build Mode WebSocket ──
+
+build_ws_connections: list[WebSocket] = []
+
+async def publish_build_event(event_type: str, module: str, message: str, detail: str = "", status: str = "ok"):
+    """Emit a build event to all connected Build Mode clients."""
+    event = {
+        "id": str(uuid.uuid4())[:8],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "type": event_type,
+        "module": module,
+        "message": message,
+        "detail": detail,
+        "status": status,
+    }
+    dead = []
+    for ws in build_ws_connections:
+        try:
+            await ws.send_json(event)
+        except Exception:
+            dead.append(ws)
+    for ws in dead:
+        build_ws_connections.remove(ws)
+
+@app.websocket("/api/ws/build")
+async def build_websocket(ws: WebSocket):
+    await ws.accept()
+    build_ws_connections.append(ws)
+    try:
+        while True:
+            await ws.receive_text()  # keep alive
+    except WebSocketDisconnect:
+        pass
+    finally:
+        if ws in build_ws_connections:
+            build_ws_connections.remove(ws)
 
 @app.websocket("/api/ws/agents")
 async def agent_websocket(ws: WebSocket):
@@ -399,8 +446,10 @@ async def execute_agent(req: AgentTask):
     result = await orchestrator.execute(req.agent_id, req.task)
     if "error" in result:
         await run_history.complete(run_id, "failed", result.get("error"))
+        await publish_build_event("api_call", "orchestrator", f"Agent {req.agent_id} failed: {result.get('error')}", status="error")
     else:
         await run_history.complete(run_id, "completed")
+        await publish_build_event("api_call", "orchestrator", f"Agent {req.agent_id} completed successfully", status="ok")
     return result
 
 @app.post("/api/agents/workflow")
@@ -444,6 +493,7 @@ async def upload_file(file: UploadFile = File(...), entity: str = Form(...)):
             shutil.copyfileobj(file.file, buffer)
 
         parsed_data = await orchestrator.ingest(str(file_path), entity)
+        await publish_build_event("api_call", "parsing", f"File ingested: {safe_name} for entity {entity}", status="ok")
         return {
             "success": True,
             "filename": safe_name,
@@ -472,6 +522,7 @@ async def start_mission(req: MissionRequest):
         raise HTTPException(status_code=429, detail="Rate limit: max 5 missions per minute")
     try:
         logger.info(f"Starting assistance mission for entity: {req.entity}, file: {req.filepath}")
+        await publish_build_event("api_call", "orchestrator", f"Mission started for entity: {req.entity}", detail=f"file: {req.filepath or 'none'}", status="ok")
         result = await orchestrator.run_mission(req.entity, req.filepath)
         # Forward every orchestrator key the API surface actually uses. We deliberately
         # pass-through instead of cherry-picking so future orchestrator additions (e.g. a new
@@ -1087,6 +1138,7 @@ async def moa_analyze(req: MoARequest):
 
     from fastapi.responses import StreamingResponse
     logger.info(f"MoA analysis: prompt_len={len(req.prompt)} entity={req.entity or 'none'}")
+    await publish_build_event("api_call", "moa", f"MoA analysis started", detail=f"prompt_len={len(req.prompt)}, entity={req.entity or 'none'}", status="ok")
 
     return StreamingResponse(
         moa_engine.analyze(req.prompt, req.system_prompt),
