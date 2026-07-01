@@ -16,6 +16,7 @@ from parsing_engine import ParsingEngine
 from vector_store import VectorStore
 from wiki_vault import WikiVault, export_on_mission_enabled
 from skill_router import SkillRouter
+import guardrails
 from phases import (
     MissionContext, MissionPhase, DEFAULT_PHASES,
     PlanningPhase, ResearchPhase, EvaluationPhase, SynthesisPhase, IngestionPhase,
@@ -864,9 +865,29 @@ class AgentOrchestrator:
         """Runs the complete assistance research mission from start to finish.
 
         Uses the phase pipeline for modularity and concurrent mission support.
+        Pre-guardrails validate entity name, objective, and file paths before any cost.
         """
         mission_id = str(uuid.uuid4())
         self._current_mission_id = mission_id
+
+        # Pre-guardrails: validate inputs before any cost
+        pre_warnings = guardrails.apply_pre_guardrail(
+            entity_name=entity_name,
+            filepath=uploaded_filepath or "",
+        )
+        for w in pre_warnings:
+            logger.warning(f"Pre-guardrail warning: {w}")
+
+        # Sanitize entity name
+        try:
+            entity_name = guardrails.sanitize_entity_name(entity_name)
+        except ValueError as e:
+            return {
+                "mission_id": mission_id,
+                "entity_name": entity_name,
+                "error": f"Invalid entity name: {e}",
+                "verified": False,
+            }
 
         # Initialize mission context
         ctx = MissionContext(

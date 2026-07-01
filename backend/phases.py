@@ -3,11 +3,13 @@
 Extracts the monolithic run_mission() into composable phases:
 - PlanningPhase: decompose mission into research subtasks
 - ResearchPhase: Scout + Librarian parallel execution
-- EvaluationPhase: Critic gate with retry loop
+- EvaluationPhase: Critic gate with conditional branching
 - SynthesisPhase: dual-output report + wiki entry
 - IngestionPhase: re-ingest synthesized entry + vault export
 
 Each phase is independently testable and enables concurrent missions.
+Conditional branching: if critic score < threshold and iterations remain,
+the loop re-enters ResearchPhase with critic feedback as context.
 """
 
 import os
@@ -22,6 +24,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Dict, Any, List, Optional, Tuple
 
+import guardrails
+
 logger = logging.getLogger("tangle.phases")
 
 # Import metrics (will be available after metrics.py is created)
@@ -29,6 +33,48 @@ try:
     import metrics as tangle_metrics
 except ImportError:
     tangle_metrics = None
+
+
+# ── Entity type heuristics (no LLM cost) ────────────────────────
+
+_COMPANY_SUFFIXES = [
+    "ab", "abp", "ltd", "llc", "gmbh", "inc", "corp", "corporation",
+    "sa", "nv", "bv", "plc", "ag", "kg", "ohg", "sarl", "spa",
+    "aps", "sdn bhd", "pty", "ltd.", "inc.", "llp",
+]
+_LEGAL_FORM_PREFIXES = ["ab ", "abp ", "gmbh ", "sa ", "nv ", "bv "]
+
+
+def _detect_entity_type(entity_name: str) -> str:
+    """Determine likely entity type using heuristics.
+
+    Returns one of: 'company', 'person', 'domain', 'product', 'general'.
+    No LLM call — pure pattern matching.
+    """
+    name = entity_name.strip().lower()
+
+    # Domain / URL
+    if re.match(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.[a-z]{2,}$", name) or \
+       re.match(r"^https?://", name):
+        return "domain"
+
+    # Company indicators
+    for suffix in _COMPANY_SUFFIXES:
+        if name.endswith(f" {suffix}") or name.endswith(f".{suffix}"):
+            return "company"
+    for prefix in _LEGAL_FORM_PREFIXES:
+        if name.startswith(prefix):
+            return "company"
+    if re.search(r"\b(?:corp|limited|incorporated|company|group|holdings?|ventures|partners)\b", name):
+        return "company"
+
+    # Person indicators: "FirstName LastName" pattern (2-4 words, capitalized)
+    words = name.split()
+    if 2 <= len(words) <= 4 and all(w[0].isupper() if w else False for w in words):
+        if not any(w in name for w in ["ab ", "ltd", "inc"]):
+            return "person"
+
+    return "general"
 
 
 @dataclass
@@ -52,6 +98,10 @@ class MissionContext:
     usage: Dict[str, Any] = field(default_factory=dict)
     selected_skills: List[Tuple[str, float]] = field(default_factory=list)
     skill_context: str = ""
+    entity_type: str = "general"
+    iteration_count: int = 0
+    max_iterations: int = 3
+    loop_feedback: str = ""
 
 
 class MissionPhase(ABC):
@@ -83,14 +133,29 @@ class PlanningPhase(MissionPhase):
 
     Uses the Planner agent to generate a research plan based on
     the entity name and any ingested file content.
+    Detects entity type heuristically (no LLM cost) to guide phase execution.
     """
 
     async def execute(self, ctx: MissionContext) -> MissionContext:
+        ctx.entity_type = _detect_entity_type(ctx.entity_name)
+        self._emit({
+            "type": "entity_type_detected",
+            "entity_type": ctx.entity_type,
+            "entity_name": ctx.entity_name,
+        })
+        logger.info(f"Entity type detected: {ctx.entity_type} for '{ctx.entity_name}'")
+
         self._emit({"type": "agent_think", "agent_id": "planner", "turn": 1})
 
         plan_prompt = f"Develop a plan to research ways to help '{ctx.entity_name}'."
         if ctx.wiki_entry:
             plan_prompt += f" We have ingested files containing: {ctx.wiki_entry['raw_content'][:500]}"
+        if ctx.loop_feedback:
+            plan_prompt += (
+                f"\n\nThis is iteration {ctx.iteration_count + 1}/{ctx.max_iterations}. "
+                f"Previous research was critiqued as: {ctx.loop_feedback[:500]}"
+                f"\n\nFocus on addressing the gaps identified above."
+            )
 
         planner_prompt = self.orch.AGENT_DEFS["planner"]["prompt"].format(entity=ctx.entity_name)
         if ctx.skill_context:
@@ -110,6 +175,11 @@ class PlanningPhase(MissionPhase):
             tangle_metrics.record_provider_call(provider, duration, "success")
 
         ctx.plan = resp.get("content", "Research the entity.")
+
+        # Post-guardrail: sanitize
+        safe_plan, _ = guardrails.apply_post_guardrail("planner", ctx.plan)
+        ctx.plan = safe_plan
+
         self._emit({"type": "agent_complete", "agent_id": "planner", "result": ctx.plan[:400] + "..."})
         return ctx
 
@@ -119,89 +189,145 @@ class ResearchPhase(MissionPhase):
 
     Scout searches the web; Librarian queries the internal wiki.
     Both run concurrently when a wiki entry exists.
+    Guardrails applied post-agent to sanitize and validate outputs.
     """
 
     async def execute(self, ctx: MissionContext) -> MissionContext:
         self._emit({"type": "workflow_step", "agent_id": "maestro", "task": "Dispatching Research Agents"})
 
+        # Skip librarian for entity types that don't have uploaded docs
+        skip_librarian = not ctx.wiki_entry
+        if ctx.entity_type == "domain":
+            self._emit({"type": "event_log", "entry": {
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "level": "INFO", "agent": "System",
+                "message": f"Entity type is '{ctx.entity_type}' — no internal wiki lookup needed"
+            }})
+
+        scout_feedback = ""
+        if ctx.loop_feedback:
+            scout_feedback = (
+                f"Previous research was critiqued as insufficient. "
+                f"Critique: {ctx.loop_feedback[:800]}\n\n"
+                f"Perform DEEPER research targeting the gaps above."
+            )
+
         scout_task = self.orch.delegate(
-            f"Search for external background, vulnerabilities, and solutions for {ctx.entity_name}.",
+            scout_feedback or f"Search for external background, vulnerabilities, and solutions for {ctx.entity_name}.",
             "scout",
             ctx.entity_name,
             skill_context=ctx.skill_context,
         )
 
-        if ctx.wiki_entry:
+        tasks = [scout_task]
+        if ctx.wiki_entry and not skip_librarian:
             lib_task = self.orch.delegate(
                 f"Extract all relevant help insights and details for {ctx.entity_name} from the uploaded documents.",
                 "librarian",
                 ctx.entity_name,
                 skill_context=ctx.skill_context,
             )
-            ctx.findings = list(await asyncio.gather(scout_task, lib_task))
-        else:
-            scout_result = await scout_task
-            ctx.findings = [scout_result]
+            tasks.append(lib_task)
+
+        results = await asyncio.gather(*tasks)
+        ctx.findings = list(results)
+
+        # Apply post-guardrails to all findings
+        sanitized = []
+        for f in ctx.findings:
+            safe, _ = guardrails.apply_post_guardrail("scout", f)
+            sanitized.append(safe)
+        ctx.findings = sanitized
 
         return ctx
 
 
 class EvaluationPhase(MissionPhase):
-    """Phase 4: Critic evaluation gate with retry loop.
+    """Phase 4: Critic evaluation gate with conditional branching.
 
-    If the critic score is below threshold, retries Scout with
-    refined queries (exponential backoff).
+    If the critic score is below threshold and iterations remain,
+    the loop re-enters ResearchPhase with critic feedback as context.
+    This creates an adaptive pipeline: plan → research → evaluate →
+    (loop if score < threshold) → synthesize → ingest.
+
+    Key differences from simple retry:
+    - Full re-entry through PlanningPhase (not just scout retry)
+    - Planner sees the critique and adjusts the research plan
+    - Iteration count tracked to prevent infinite loops
+    - Exponential backoff between iterations
     """
 
     async def execute(self, ctx: MissionContext) -> MissionContext:
         self._emit({"type": "workflow_step", "agent_id": "maestro", "task": "Evaluating gathered facts"})
 
+        crit_threshold = float(os.getenv("TANGLE_CRITIC_THRESHOLD", "0.7"))
+        max_iter = int(os.getenv("TANGLE_ORCHESTRATOR_MAX_RETRIES", "3"))
+
         combined_text = "\n\n".join(ctx.findings)
         ctx.evaluation = await self.orch.evaluate(
             combined_text,
-            f"Does this content explain the situation of '{ctx.entity_name}' and provide concrete ways to help?"
+            f"Does this content explain the situation of '{ctx.entity_name}' and provide concrete ways to help?",
+            threshold=crit_threshold,
         )
 
-        # Retry loop with exponential backoff
-        max_retries = int(os.getenv("TANGLE_ORCHESTRATOR_MAX_RETRIES", "3"))
-        retry_count = 0
+        # Post-guardrail: validate critic output
+        critic_text = json.dumps(ctx.evaluation)
+        guardrails.apply_post_guardrail("critic", critic_text)
 
-        while not ctx.evaluation["passed"] and retry_count < max_retries:
-            retry_count += 1
-            backoff_s = 2 ** (retry_count - 1)  # 1s, 2s, 4s
+        # Conditional branching loop: re-enter research if score too low
+        while not ctx.evaluation["passed"] and ctx.iteration_count < max_iter:
+            ctx.iteration_count += 1
+            backoff_s = 2 ** (ctx.iteration_count - 1)
+
             logger.info(
-                f"Evaluation gate failed (attempt {retry_count}/{max_retries}). "
-                f"Backing off {backoff_s}s before retry."
+                f"Conditional branch: critic score {ctx.evaluation.get('score', 0):.2f} "
+                f"< {crit_threshold} (iteration {ctx.iteration_count}/{max_iter}). "
+                f"Re-entering research phase in {backoff_s}s."
             )
             self._emit({
-                "type": "workflow_step", "agent_id": "maestro",
-                "task": f"Gate failed (attempt {retry_count}/{max_retries}). "
-                        f"Retrying in {backoff_s}s: {ctx.evaluation['critique'][:80]}"
+                "type": "conditional_branch",
+                "from": "evaluation",
+                "to": "research",
+                "reason": f"critic_score {ctx.evaluation.get('score', 0):.2f} < {crit_threshold}",
+                "iteration": ctx.iteration_count,
+                "critique": ctx.evaluation.get("critique", "")[:200],
             })
+            self._emit({
+                "type": "workflow_step", "agent_id": "maestro",
+                "task": f"Branching back to research (iter {ctx.iteration_count}/{max_iter}): "
+                        f"{ctx.evaluation.get('critique', '')[:120]}"
+            })
+
             await asyncio.sleep(backoff_s)
 
-            retry_findings = await self.orch.delegate(
-                f"Perform deeper research based on this critique: {ctx.evaluation['critique']}",
-                "scout",
-                ctx.entity_name
-            )
-            ctx.findings.append(retry_findings)
+            # Store critique as loop_feedback for next planning pass
+            ctx.loop_feedback = ctx.evaluation.get("critique", "")
 
-            # Re-evaluate after retry
+            # Re-enter PlanningPhase with the critique as context
+            planner = PlanningPhase(self.orch)
+            ctx = await planner.execute(ctx)
+
+            # Re-enter ResearchPhase with focused critique
+            researcher = ResearchPhase(self.orch)
+            ctx = await researcher.execute(ctx)
+
+            # Re-evaluate with expanded findings
             combined_text = "\n\n".join(ctx.findings)
             ctx.evaluation = await self.orch.evaluate(
                 combined_text,
-                f"Does this content explain the situation of '{ctx.entity_name}' and provide concrete ways to help?"
+                f"Does this content explain the situation of '{ctx.entity_name}' and provide concrete ways to help?",
+                threshold=crit_threshold,
             )
+            guardrails.apply_post_guardrail("critic", json.dumps(ctx.evaluation))
 
         if not ctx.evaluation["passed"]:
             logger.warning(
-                f"Evaluation gate still failing after {max_retries} retries. "
+                f"Evaluation gate still failing after {max_iter} iterations. "
                 f"Continuing with best-effort synthesis."
             )
             self._emit({
                 "type": "workflow_step", "agent_id": "maestro",
-                "task": f"Gate still failing after {max_retries} retries. Using best-effort."
+                "task": f"Gate still failing after {max_iter} iterations. Using best-effort."
             })
 
         return ctx
@@ -252,6 +378,9 @@ class SynthesisPhase(MissionPhase):
         ctx.report_markdown = synth_result["report_markdown"]
         ctx.wiki_entry_markdown = synth_result["wiki_entry_markdown"]
         ctx.wiki_entry_chunk_id = synth_result["wiki_entry_chunk_id"]
+
+        # Post-guardrail: validate synth output structure
+        guardrails.apply_post_guardrail("synthesizer", ctx.report_markdown)
 
         return ctx
 
