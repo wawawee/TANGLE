@@ -20,7 +20,8 @@ embedding_keywords:
   - business verification
 mcps: []
 apis:
-  - opencorporates.com
+  - openregistry.sophymarine.com  # free: 20 req/min, no signup, UK/EU/EEA
+  - opencorporates.com            # free: 50/day (contact for public-benefit key)
   - allabolag.se
 skills:
   - company_verification

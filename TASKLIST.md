@@ -213,3 +213,21 @@ Ideas från Kimis review (June 2026) som inte är Phase 0 scope men värda att d
 - [ ] **SkillRouter edge case-tester** — fler tester för: tom embedding, concurrent select-anrop, korrupt YAML frontmatter, extremt långa entity names, skill-dir tom/finns inte.
 - [ ] **README-sektion om skills** — hur de fungerar (embedding match), hur man lägger till en ny, API key requirements, badge overview.
 - [ ] **Phase 2: Autoresearch / Eval loop** — batch-kör missions mot test cases, utvärdera rapportkvalitet, auto-regression. Kräver Eval Mode UI.
+
+---
+
+## 👑 CLIENTS-COME-LATER WISHLIST (betalda API:er för oljeshejker)
+
+När vi pitchar till kapitalstarka kunder som vill ha "allt" — spara dessa som upsell:
+
+| API | Pris | Vad | Varför |
+|-----|------|-----|--------|
+| OpenCorporates Essentials | £2,250/år | 200 calls/day, 500/mån | Global bolagsdata, 200M+ entiteter |
+| Sayari | betald | Supply chain / UBO / sanctions | Bäst på ownership mapping |
+| LSEG (Refinitiv) | enterprise | World-Check, Due Diligence | AML/KYC-standard |
+| Dun & Bradstreet | enterprise | Company profile + risk scores | Bread & butter due diligence |
+| Shodan | $49/mån (developer) | IoT/network scanning | Cybersecurity skill |
+| Crunchbase Pro | $299/mån | Startup/company intelligence | För tech-investeringar |
+| PitchBook | enterprise | Private equity / VC data | För investment cases |
+| Bureau van Dijk (Moody's) | enterprise | Orbis, ownership trees | Guldstandard för corporate tree |
+| LexisNexis Diligence | enterprise | Global sanctions + adverse media | För compliance workflow |
